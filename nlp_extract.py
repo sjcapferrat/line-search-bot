@@ -1,9 +1,15 @@
+# nlp_extract.py（安全版：APIキー未設定でも落ちない）
 import os, re, json
 from typing import Tuple, Dict, Any
-from openai import OpenAI
 
-# OpenAIのキーは環境変数 OPENAI_API_KEY を利用
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# 先に環境変数を読む
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# 鍵がある時だけクライアントを作る（※ここで Import してOK）
+client = None
+if OPENAI_API_KEY:
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
 FUNCTION_SCHEMA = {
     "name": "build_search_query",
@@ -33,8 +39,8 @@ SYSTEM = (
 async def extract_query(user_text: str) -> Tuple[Dict[str, Any], str]:
     rule_query = rule_based_guess(user_text)
 
-    # OpenAI が未設定ならルールのみ
-    if client.api_key is None or client.api_key == "":
+    # 🔐 OpenAI未設定なら安全にフォールバック
+    if client is None:
         return rule_query, f"(GPT未使用) 抽出条件: {rule_query}"
 
     try:
@@ -48,20 +54,27 @@ async def extract_query(user_text: str) -> Tuple[Dict[str, Any], str]:
             tools=[{"type": "function", "function": FUNCTION_SCHEMA}],
             tool_choice={"type": "function", "function": {"name": "build_search_query"}},
         )
-        tool_call = resp.choices[0].message.tool_calls[0]
-        gpt_args = json.loads(tool_call.function.arguments)
 
+        # 念のため防御的に
+        choice = resp.choices[0]
+        tool_calls = getattr(choice.message, "tool_calls", None) or []
+        if not tool_calls:
+            # ツール未呼び出しならルールのみ
+            return rule_query, f"(GPT応答にツール呼び出しなし) 抽出条件: {rule_query}"
+
+        gpt_args = json.loads(tool_calls[0].function.arguments)
         merged = {**rule_query, **{k: v for k, v in gpt_args.items() if v}}
         explain = f"抽出条件: {merged}"
         return merged, explain
 
     except Exception as e:
+        # 例外時も落とさずルールにフォールバック
         return rule_query, f"(GPT抽出失敗のためルール適用) 抽出条件: {rule_query} / error={e}"
 
 def rule_based_guess(text: str):
     q: Dict[str, str] = {}
     # 深さ/厚さ
-    m = re.search(r'(\d+(?:\.\d+)?)\s*(mm|ミリ|ｍｍ)', text)
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(?:mm|ミリ|ｍｍ)', text)
     if m:
         q["深さまたは厚さ"] = f"{m.group(1)}mm"
     # 代表的な作業名キーワード（必要に応じて拡張）
@@ -71,8 +84,5 @@ def rule_based_guess(text: str):
     ]
     for kw in keywords:
         if kw in text:
-            if kw == "ハツリ":
-                q["作業名"] = "表面ハツリ"
-            else:
-                q["作業名"] = kw
+            q["作業名"] = "表面ハツリ" if kw in ("ハツリ", "表面ハツリ") else kw
     return q
