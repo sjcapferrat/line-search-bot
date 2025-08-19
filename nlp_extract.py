@@ -1,11 +1,8 @@
-# nlp_extract.py（安全版：APIキー未設定でも落ちない）
+# nlp_extract.py（安全版）
 import os, re, json
 from typing import Tuple, Dict, Any
 
-# 先に環境変数を読む
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-# 鍵がある時だけクライアントを作る（※ここで Import してOK）
 client = None
 if OPENAI_API_KEY:
     from openai import OpenAI
@@ -39,7 +36,7 @@ SYSTEM = (
 async def extract_query(user_text: str) -> Tuple[Dict[str, Any], str]:
     rule_query = rule_based_guess(user_text)
 
-    # 🔐 OpenAI未設定なら安全にフォールバック
+    # 🔐 鍵が無ければルールのみ
     if client is None:
         return rule_query, f"(GPT未使用) 抽出条件: {rule_query}"
 
@@ -54,12 +51,9 @@ async def extract_query(user_text: str) -> Tuple[Dict[str, Any], str]:
             tools=[{"type": "function", "function": FUNCTION_SCHEMA}],
             tool_choice={"type": "function", "function": {"name": "build_search_query"}},
         )
-
-        # 念のため防御的に
         choice = resp.choices[0]
         tool_calls = getattr(choice.message, "tool_calls", None) or []
         if not tool_calls:
-            # ツール未呼び出しならルールのみ
             return rule_query, f"(GPT応答にツール呼び出しなし) 抽出条件: {rule_query}"
 
         gpt_args = json.loads(tool_calls[0].function.arguments)
@@ -68,21 +62,14 @@ async def extract_query(user_text: str) -> Tuple[Dict[str, Any], str]:
         return merged, explain
 
     except Exception as e:
-        # 例外時も落とさずルールにフォールバック
         return rule_query, f"(GPT抽出失敗のためルール適用) 抽出条件: {rule_query} / error={e}"
 
 def rule_based_guess(text: str):
     q: Dict[str, str] = {}
-    # 深さ/厚さ
     m = re.search(r'(\d+(?:\.\d+)?)\s*(?:mm|ミリ|ｍｍ)', text)
     if m:
         q["深さまたは厚さ"] = f"{m.group(1)}mm"
-    # 代表的な作業名キーワード（必要に応じて拡張）
-    keywords = [
-        "表面目荒らし","表面ハツリ","表面研ぎ出し","雨打たれ処理",
-        "塗膜や堆積物の除去","張り物除去","溝切り"
-    ]
-    for kw in keywords:
+    for kw in ["表面目荒らし","表面ハツリ","表面研ぎ出し","雨打たれ処理","塗膜や堆積物の除去","張り物除去","溝切り"]:
         if kw in text:
-            q["作業名"] = "表面ハツリ" if kw in ("ハツリ", "表面ハツリ") else kw
+            q["作業名"] = "表面ハツリ" if kw in ("ハツリ","表面ハツリ") else kw
     return q
