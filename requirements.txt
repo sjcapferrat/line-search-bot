@@ -4,3 +4,4 @@ line-bot-sdk==3.13.0
 pydantic==2.8.2
 httpx==0.27.2
 openai>=1.37.0
+pandas==2.2.2
