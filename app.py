@@ -20,9 +20,20 @@ async def add_json_charset(request: Request, call_next):
         resp.headers["content-type"] = "application/json; charset=utf-8"
     return resp
 
+# app.py どこでもOK（app = FastAPI(...) の後あたり）
+from fastapi.responses import Response
+
+@app.get("/")
+def root():
+    # RenderのヘルスチェックがHEAD/GET / を叩いても200で返す
+    return {"status": "ok"}
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    # ログのノイズ防止（/favicon.ico 404 を避ける）
+    return Response(status_code=204)
+
 logger = logging.getLogger("uvicorn")
-
-
 
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
