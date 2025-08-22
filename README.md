@@ -49,3 +49,21 @@ uvicorn app:app --reload
 ### 任意のCSVパスを使いたい場合
 - 環境変数 `RAG_CSV_PATH` を設定すると、ユーザースクリプト内の `CSV_PATH` を上書きします。
 
+## 8. 環境変数（追加推奨）
+- `SEARCH_SCRIPT_PATH` = `./ver4_2_python_based_RAG_wo_GPT.py`
+- `RAG_CSV_PATH` = `./restructured_file.csv`
+- `PYTHON_VERSION` = `3.12.3`
+
+> ※ いずれも **リポジトリ直下**にファイルを置いた前提の相対パスです。  
+> ローカルの `C:\...` パスは Render では使えません。
+
+## 9. 起動確認とトラブルシュート
+- ヘルスチェック: `GET https://<your-app>.onrender.com/healthz` → `{"status":"ok"}`
+- Verify 失敗/502 のとき:
+  - `Logs` に `FileNotFoundError` → CSV/pyの置き忘れ or パス違い
+  - `OpenAIError: api_key` → `OPENAI_API_KEY` 未設定（または **遅延インポート版 app.py** 未適用）
+  - `Invalid signature`（手動POST時）→ 正常。Webhookエンドポイントは生きています
+
+## 10. 実装メモ
+- `app.py` は **遅延インポート** 版（/callback 内で `nlp_extract` と `search_core` を import）
+- `search_adapter.py` は **遅延ロード** 版（最初の検索時に CSV を読み込む）
