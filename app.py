@@ -13,7 +13,10 @@ from fastapi import FastAPI, Request, Body
 from fastapi.responses import PlainTextResponse, Response
 from linebot import LineBotApi, WebhookParser
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage,
+    MessageAction, QuickReply, QuickReplyButton
+)
 
 # ==============================
 # 基本セットアップ
@@ -28,11 +31,21 @@ def _norm(s: str) -> str:
     """全角/半角・濁点結合などを統一して比較しやすくする"""
     return unicodedata.normalize("NFKC", s or "")
 
-# ユーザーごとの Clarify 選択待ち状態（揮発）
-# 例: _PENDING[sender_id] = {"clarify": dict, "query": dict, "raw": str}
-_PENDING: Dict[str, Dict[str, Any]] = {}
+# ユーザーごとの Clarify 待ち（揮発）
+_PENDING: Dict[str, Dict[str, Any]] = {}  # {"clarify": dict, "query": dict, "raw": str}
 
-# Feature flags
+# need_refine 分岐待ち（揮発）
+_STATE: Dict[str, Dict[str, Any]] = {}    # { user_id: {"mode": "await_refine_choice", "query": dict, "raw": str} }
+
+def set_session_state(user_id: str, mode: str, **kw):
+    _STATE[user_id] = {"mode": mode, **kw}
+
+def get_session_state(user_id: str) -> Optional[Dict[str, Any]]:
+    return _STATE.get(user_id)
+
+def reset_session_state(user_id: str):
+    _STATE.pop(user_id, None)
+
 ALLOW_DEV = os.environ.get("ALLOW_DEV", "1") == "1"  # 本番は 0 推奨
 FORCE_SUBSTRATE_FALLBACK = os.environ.get("FORCE_SUBSTRATE_FALLBACK", "0") == "1"
 
@@ -71,7 +84,30 @@ line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN) if CHANNEL_ACCESS_TOKEN else Non
 parser = WebhookParser(CHANNEL_SECRET) if CHANNEL_SECRET else None
 
 # ==============================
-# Clarify: nlp_extract の _needs_choice → Clarify オブジェクトへ
+# メッセージ共通部品
+# ==============================
+def tail_reset_hint(msg: str) -> str:
+    return (
+        (msg or "")
+        + "\n\n―――\n新しい検索を行う場合は「0」「０」または『リセット』、"
+          "終了は「1」「１」または『終わり』『終了』と入力してください。"
+    )
+
+def qr_reset_and_exit() -> QuickReply:
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="新規検索（0）", text="0")),
+        QuickReplyButton(action=MessageAction(label="終了（1）", text="1")),
+    ])
+
+def qr_refine_or_rank() -> QuickReply:
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="評価順 上位5を表示", text="上位5")),
+        QuickReplyButton(action=MessageAction(label="他の条件で絞り込む", text="絞り込み")),
+        QuickReplyButton(action=MessageAction(label="全件を見る", text="全件")),
+    ])
+
+# ==============================
+# Clarify: nlp_extract の _needs_choice → Clarify へ
 # ==============================
 def _clarify_from_needs_choice(filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -96,15 +132,9 @@ def _clarify_from_needs_choice(filters: Dict[str, Any]) -> Optional[Dict[str, An
 # Natural language choice utils
 # ==============================
 def _score_label_by_keywords(fragment: str, label: str) -> int:
-    """
-    fragment と label の語彙一致スコア。
-    - 直包含（ラベル丸ごと一致）は最強
-    - 括弧内の特徴語（例: 水性/硬質）も拾う
-    """
     f = _norm(fragment)
     f = re.sub(r"(のほう|の方)\s*$", "", f)
     lb = _norm(label)
-
     if lb and lb in f:
         return 100
 
@@ -116,7 +146,6 @@ def _score_label_by_keywords(fragment: str, label: str) -> int:
         if w in base or w in inside:
             keywords.add(w)
 
-    # 括弧内の特徴語
     for token in re.findall(r"[A-Za-z]+|[\u4E00-\u9FFF]+|[\u3040-\u30FF]+", inside):
         for sub in ["水性", "硬質", "無黄変", "速乾"]:
             if sub in token:
@@ -145,18 +174,9 @@ def _score_label_by_keywords(fragment: str, label: str) -> int:
     return score
 
 def _parse_chosen_text(chosen_text: str, choices: List[Dict[str, str]]) -> List[str]:
-    """
-    自然文/番号/ラベル混在の chosen_text から、選ばれた“ラベル配列”を返す。
-    - "all/全部/すべて" は全選択
-    - "unknown/わからない/任せる" は空のまま（おすすめ選定は呼び出し側）
-    - 数字(1,2) なら id マッチ
-    - それ以外はキーワードスコアで最尤ラベルを1件
-    """
     if not chosen_text:
         return []
-
     t = _norm(chosen_text).lower().strip()
-
     if t in {"all", "全部", "すべて", "全て"}:
         return [str(c.get("label", "")) for c in choices if c.get("label")]
     if t in {"unknown", "わからない", "任せる"}:
@@ -167,7 +187,6 @@ def _parse_chosen_text(chosen_text: str, choices: List[Dict[str, str]]) -> List[
     id2label = {str(c.get("id", "")).strip(): str(c.get("label", "")).strip() for c in choices}
     labels = [str(c.get("label", "")).strip() for c in choices]
 
-    # まず番号で拾う
     picked: List[str] = []
     for p in parts:
         if p in id2label and id2label[p]:
@@ -175,13 +194,11 @@ def _parse_chosen_text(chosen_text: str, choices: List[Dict[str, str]]) -> List[
     if picked:
         return picked
 
-    # ラベルそのもの一致
     for p in parts:
         for lab in labels:
             if p and (p == _norm(lab)):
                 return [lab]
 
-    # スコアで最尤を1件
     best = None
     best_score = -1
     for lab in labels:
@@ -192,23 +209,12 @@ def _parse_chosen_text(chosen_text: str, choices: List[Dict[str, str]]) -> List[
     return [best] if best else []
 
 # ==============================
-# 共通メッセージ・ヒント
-# ==============================
-RESET_HINT = "\n\n---\n新しい検索を行う場合はゼロ、０、またはリセット指示をお願いします。"
-NORESULT_MSG = "該当なしでした。もう一度検索条件を入れなおしてください。終了なら1または『終わり』『終了』と入力してください。"
-
-def _with_reset_hint(text: str) -> str:
-    text = (text or "").rstrip()
-    return f"{text}{RESET_HINT}"
-
-# ==============================
-# Webhook（LINE） — 安定版
+# Webhook（LINE）
 # ==============================
 @app.post("/callback")
 async def callback(request: Request):
     if not parser:
         logger.error("LINE credentials not set")
-        # 502 を避けるため 200 を返す
         return PlainTextResponse("OK", status_code=200)
 
     signature = request.headers.get("X-Line-Signature") or request.headers.get("x-line-signature", "")
@@ -236,136 +242,275 @@ async def callback(request: Request):
     try:
         from nlp_extract import extract_query
         from disambiguator import detect, apply_choice_to_query
-        from search_core import run_query_system
+        from search_core import run_query, run_query_system, sort_by_eval
         from formatters import to_plain_text
-        from postprocess import reorder_and_pair
     except Exception as e:
         logger.error("delayed import failed: %r\n%s", e, traceback.format_exc())
         return PlainTextResponse("OK", status_code=200)
-
-    def _sender_id(ev):
-        src = getattr(ev, "source", None)
-        return (getattr(src, "user_id", None)
-                or getattr(src, "group_id", None)
-                or getattr(src, "room_id", None)
-                or "unknown")
 
     for event in events:
         try:
             if not (isinstance(event, MessageEvent) and isinstance(event.message, TextMessage)):
                 continue
 
-            rid = _rid()
+            # 送信者ID（user / group / room）
+            src = getattr(event, "source", None)
+            user_id = None
+            if src:
+                user_id = getattr(src, "user_id", None) or getattr(src, "group_id", None) or getattr(src, "room_id", None)
+            user_id = user_id or "unknown"
+
             user_text = (event.message.text or "").strip()
-            sender_id = _sender_id(event)
-            logger.info("[%s] from=%s text=%r", rid, sender_id, user_text)
 
-            # グローバルコマンド（どの状態でも有効）
-            t = _norm(user_text)
-            if t in {"0", "０", "ゼロ", "ﾘｾｯﾄ", "リセット"}:
-                _PENDING.pop(sender_id, None)
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="新しい検索を始めます。条件を入力してください。")
-                )
+            # === グローバルコマンド ===
+            if user_text in ("0", "０", "ゼロ", "ﾘｾｯﾄ", "リセット"):
+                _PENDING.pop(user_id, None)
+                reset_session_state(user_id)
+                if line_bot_api:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="新しい検索を始めます。条件を入力してください。"))
                 continue
-            if t in {"1", "１", "終わり", "終了"}:
-                _PENDING.pop(sender_id, None)
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="終了しました。またどうぞ！")
-                )
+            if user_text in ("1", "１", "終わり", "終了"):
+                _PENDING.pop(user_id, None)
+                reset_session_state(user_id)
+                if line_bot_api:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="終了しました。またどうぞ！"))
                 continue
 
-            # ❶ Clarify の回答待ちだった場合
-            if sender_id in _PENDING:
+            # === need_refine の分岐待ちを最優先で処理 ===
+            flow = get_session_state(user_id)
+            if flow and flow.get("mode") == "await_refine_choice":
+                last_query = flow.get("query")
+                last_raw = flow.get("raw") or ""
+                choice = _norm(user_text)
+
+                if choice in {"上位5", "上位５", "5", "５", "評価順", "評価順上位5", "評価順の上位5件"}:
+                    # 全件を内部実行で取得 → 評価順 → 5件
+                    all_hits = run_query_system(last_query)  # list[dict]
+                    top5 = sort_by_eval(all_hits)[:5]
+                    txt = to_plain_text(top5, last_query, "（評価順 上位5）")
+                    if line_bot_api:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=tail_reset_hint(txt)[:4900], quick_reply=qr_reset_and_exit())
+                        )
+                    reset_session_state(user_id)
+                    continue
+
+                if choice in {"絞り込み", "絞込", "絞る"}:
+                    msg = "追加の条件を入力してください。（例：機械カテゴリー=グラインダー、下地=厚膜塗料 など）"
+                    if line_bot_api:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=tail_reset_hint(msg), quick_reply=qr_reset_and_exit())
+                        )
+                    reset_session_state(user_id)
+                    continue
+
+                if choice in {"全件", "全部", "全件表示", "全部表示", "すべて表示", "すべて"}:
+                    all_hits = run_query_system(last_query)
+                    txt = to_plain_text(all_hits, last_query, "（全件）")
+                    if line_bot_api:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=tail_reset_hint(txt)[:4900], quick_reply=qr_reset_and_exit())
+                        )
+                    reset_session_state(user_id)
+                    continue
+
+                # 想定外 → 選び直し
+                msg = "『評価順 上位5を表示』または『他の条件で絞り込む』または『全件を見る』を選んでください。"
+                if line_bot_api:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=tail_reset_hint(msg), quick_reply=qr_refine_or_rank())
+                    )
+                continue
+
+            # === Clarify の回答待ち ===
+            if user_id in _PENDING:
+                rid = _rid()
                 try:
-                    pend = _PENDING.pop(sender_id)
-                    clarify = pend["clarify"]
-                    choices = clarify.get("choices") or []
-                    chosen_labels = _parse_chosen_text(user_text, choices)
+                    pending = _PENDING.pop(user_id)
+                    clarify = pending["clarify"]
+                    raw_lower = _norm(user_text).lower().strip()
 
-                    if not chosen_labels:
-                        # 再度案内
-                        lines = ["選択肢が認識できませんでした。番号（例：1,3）またはラベル名で返信してください。", ""]
-                        for ch in choices:
-                            lines.append(f'  {ch.get("id")}) {ch.get("label")}')
-                        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
+                    if raw_lower in {"all", "すべて", "全部", "全て"}:
+                        chosen = ["all"]
+                    elif raw_lower in {"unknown", "わからない", "任せる"}:
+                        chosen = ["unknown"]
+                    else:
+                        raw_norm = raw_lower.replace("，", ",")
+                        chosen = [x.strip() for x in re.split(r"[,\s]+", raw_norm) if x.strip()]
+
+                    query_after = apply_choice_to_query(pending["query"], chosen, clarify)
+                    # Clarify のあとは通常検索フローに合流
+                    outcome = run_query(query_after)
+
+                    if outcome.status == "invalid_conditions":
+                        txt = "検索条件が認識されませんでした。他の入力をお願いします。"
+                        if line_bot_api:
+                            line_bot_api.reply_message(
+                                event.reply_token, TextSendMessage(text=tail_reset_hint(txt))
+                            )
                         continue
 
-                    query_after = apply_choice_to_query(pend["query"], chosen_labels, clarify)
-                    results = run_query_system(query_after)
-                    results = reorder_and_pair(results, pend["raw"], query_after)
+                    if outcome.status == "no_results":
+                        txt = "該当なしでした。もう一度検索条件を入れなおしてください。終了なら1または『終わり』『終了』と入力してください。"
+                        if line_bot_api:
+                            line_bot_api.reply_message(
+                                event.reply_token,
+                                TextSendMessage(text=tail_reset_hint(txt), quick_reply=qr_reset_and_exit())
+                            )
+                        continue
 
-                    text_msg = to_plain_text(results, query_after, "(clarified)")
-                    if not results:
-                        text_msg = NORESULT_MSG
-                    else:
-                        text_msg = _with_reset_hint(text_msg)
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text_msg[:4900]))
+                    if outcome.status == "range_out":
+                        qrp = qr_reset_and_exit()
+                        if outcome.total_hits and outcome.suggest_depth is not None:
+                            qrp.items.insert(0, QuickReplyButton(
+                                action=MessageAction(label=f"{outcome.suggest_depth:.1f}mmで再検索",
+                                                     text=f"{outcome.suggest_depth:.1f}mm")
+                            ))
+                        if line_bot_api:
+                            line_bot_api.reply_message(
+                                event.reply_token,
+                                TextSendMessage(text=tail_reset_hint(outcome.message or "範囲外です。"), quick_reply=qrp)
+                            )
+                        continue
+
+                    if outcome.status == "need_refine":
+                        set_session_state(user_id, "await_refine_choice", query=query_after, raw=pending["raw"])
+                        msg = outcome.message or f"検索結果数が多いです（{outcome.total_hits}件）。"
+                        if line_bot_api:
+                            line_bot_api.reply_message(
+                                event.reply_token,
+                                TextSendMessage(text=tail_reset_hint(msg), quick_reply=qr_refine_or_rank())
+                            )
+                        continue
+
+                    # OK
+                    txt = to_plain_text(outcome.singles or [], query_after, "(clarified)")
+                    if line_bot_api:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=tail_reset_hint(txt)[:4900], quick_reply=qr_reset_and_exit())
+                        )
                     continue
 
                 except Exception as e:
-                    logger.error("[%s] clarify handling failed: %r\n%s", rid, e, traceback.format_exc())
-                    line_bot_api.reply_message(
-                        event.reply_token,
-                        TextSendMessage(text=f"選択の処理でエラーが発生しました。最初から入力し直してください。（Error ID: {rid}）")
+                    text_for_log = pending["raw"] if "pending" in locals() and isinstance(pending, dict) else None
+                    logger.error(
+                        "[%s] clarify handling failed: %r\ntext=%r\nclarify=%r\ntrace=\n%s",
+                        rid, e, text_for_log, locals().get("clarify"), traceback.format_exc()
                     )
+                    if line_bot_api:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=f"選択の処理でエラーが発生しました。最初から入力し直してください。（Error ID: {rid}）")
+                        )
                     continue
 
-            # ❷ 抽出 → Clarify 判定
+            # === ここから通常フロー（抽出→Clarify判定→検索） ===
             try:
-                query, explain = extract_query(user_text)
+                structured_query, explain = extract_query(user_text)
             except Exception as e:
-                logger.error("[%s] extract_query failed: %r\n%s", rid, e, traceback.format_exc())
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=f"検索中にエラーが発生しました。時間をおいてお試しください。（Error ID: {rid}）")
-                )
+                rid = _rid()
+                logger.error("[/%s] extract_query failed: %r\ntext=%r\ntrace=\n%s",
+                             "callback", e, user_text, traceback.format_exc())
+                if line_bot_api:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=f"検索中にエラーが発生しました。時間をおいてお試しください。（Error ID: {rid}）")
+                    )
                 continue
 
-            c_from_needs = _clarify_from_needs_choice(query)
-            clarifies = [c_from_needs] if c_from_needs else (detect(user_text) or [])
+            # Clarify 判定（_needs_choice を優先、なければ detect）
+            clarifies = []
+            c_from_needs = _clarify_from_needs_choice(structured_query)
+            if c_from_needs:
+                clarifies = [c_from_needs]
+            else:
+                try:
+                    clarifies = detect(user_text) or []
+                except Exception:
+                    clarifies = []
+
             if clarifies:
                 c = clarifies[0]
-                _PENDING[sender_id] = {"clarify": c, "query": query, "raw": user_text}
+                _PENDING[user_id] = {"clarify": c, "query": structured_query, "raw": user_text}
 
-                lines = []
-                lines.append(str(c.get("question") or "条件をもう少し具体化してください。"))
+                lines: List[str] = []
+                qtxt = str(c.get("question") or "条件をもう少し具体化してください。")
+                lines.append(qtxt)
                 lines.append("")
                 lines.append("次から選んで返信してください（複数可）：")
                 for ch in c.get("choices", []):
-                    lines.append(f'  {ch.get("id")}) {ch.get("label")}')
-                lines += ["", "ヒント:", "・番号だけでもOK（例：1,3）", "・ラベルでもOK（例：厚膜塗料（エポキシ））", "・全て = all / わからない = unknown"]
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
+                    cid = str(ch.get("id", "")).strip()
+                    label = str(ch.get("label", "")).strip()
+                    if cid and label:
+                        lines.append(f"  {cid}) {label}")
+                lines += [
+                    "",
+                    "ヒント:",
+                    "・番号だけでもOK（例：1,3）",
+                    "・ラベルそのものでもOK（例：厚膜塗料（エポキシ））",
+                    "・全て = all / わからない = unknown も可",
+                ]
+                if line_bot_api:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
                 continue
 
-            # ❸ 検索 → 並べ替え → 返信
-            try:
-                results = run_query_system(query)
-                results = reorder_and_pair(results, user_text, query)
-            except Exception as e:
-                logger.error("[%s] search failed: %r\n%s", rid, e, traceback.format_exc())
+            # 検索実行 → ステータス分岐
+            outcome = run_query(structured_query)
+
+            if outcome.status == "invalid_conditions":
+                txt = "検索条件が認識されませんでした。他の入力をお願いします。"
+                if line_bot_api:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tail_reset_hint(txt)))
+                continue
+
+            if outcome.status == "no_results":
+                txt = "該当なしでした。もう一度検索条件を入れなおしてください。終了なら1または『終わり』『終了』と入力してください。"
+                if line_bot_api:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=tail_reset_hint(txt), quick_reply=qr_reset_and_exit())
+                    )
+                continue
+
+            if outcome.status == "range_out":
+                qrp = qr_reset_and_exit()
+                if outcome.total_hits and outcome.suggest_depth is not None:
+                    qrp.items.insert(0, QuickReplyButton(
+                        action=MessageAction(label=f"{outcome.suggest_depth:.1f}mmで再検索",
+                                             text=f"{outcome.suggest_depth:.1f}mm")
+                    ))
+                if line_bot_api:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=tail_reset_hint(outcome.message or "範囲外です。"), quick_reply=qrp)
+                    )
+                continue
+
+            if outcome.status == "need_refine":
+                set_session_state(user_id, "await_refine_choice", query=structured_query, raw=user_text)
+                msg = outcome.message or f"検索結果数が多いです（{outcome.total_hits}件）。"
+                if line_bot_api:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=tail_reset_hint(msg), quick_reply=qr_refine_or_rank())
+                    )
+                continue
+
+            # OK
+            txt = to_plain_text(outcome.singles or [], structured_query, explain)
+            if line_bot_api:
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text=f"検索中にエラーが発生しました。時間をおいてお試しください。（Error ID: {rid}）")
+                    TextSendMessage(text=tail_reset_hint(txt)[:4900], quick_reply=qr_reset_and_exit())
                 )
-                continue
-
-            if not results:
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=NORESULT_MSG)
-                )
-                continue
-
-            text_msg = to_plain_text(results, query, explain)
-            text_msg = _with_reset_hint(text_msg)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text_msg[:4900]))
 
         except Exception as e:
             logger.error("event handling failed: %r\n%s", e, traceback.format_exc())
-            # ここで握りつぶして次イベントへ
             continue
 
     return PlainTextResponse("OK", status_code=200)
@@ -390,16 +535,13 @@ if ALLOW_DEV:
             if not text:
                 return {"status": "error", "message": "text を入れてください"}
 
-            # 遅延インポート
             from nlp_extract import extract_query
             from disambiguator import detect
-            from search_core import run_query_system
-            from postprocess import reorder_and_pair
+            from search_core import run_query
             from formatters import to_plain_text
 
             query, explain = extract_query(text)
 
-            # _needs_choice → Clarify
             clarify = _clarify_from_needs_choice(query)
             clarifies_detect = []
             if not clarify:
@@ -436,30 +578,31 @@ if ALLOW_DEV:
                     }
                 return res
 
-            # Clarify なし → 検索
-            results = run_query_system(query)
-            results = reorder_and_pair(results, text, query)
-            rendered = to_plain_text(results, query, "(dev)")
-            if not results:
-                rendered = NORESULT_MSG
+            outcome = run_query(query)
 
-            res = {"status": "ok", "result_text": _with_reset_hint(rendered), "query": query}
+            if outcome.status == "invalid_conditions":
+                rendered = "検索条件が認識されませんでした。他の入力をお願いします。"
+            elif outcome.status == "no_results":
+                rendered = "該当なしでした。もう一度検索条件を入れなおしてください。終了なら1または『終わり』『終了』と入力してください。"
+            elif outcome.status == "range_out":
+                rendered = outcome.message or "範囲外です。"
+            elif outcome.status == "need_refine":
+                rendered = outcome.message or f"検索結果数が多いです（{outcome.total_hits}件）。"
+            else:
+                rendered = to_plain_text(outcome.singles or [], query, "(dev)")
+
+            res = {"status": outcome.status, "result_text": rendered, "query": query}
             if debug:
                 res["debug"] = {
                     "text": text.encode("utf-8", "replace").decode("utf-8", "replace"),
                     "explain": explain,
                     "env": {"FORCE_SUBSTRATE_FALLBACK": FORCE_SUBSTRATE_FALLBACK},
-                    "mods": {},
                     "query": query,
-                    "needs_choice": (query.get("_needs_choice") or {}).get("下地の状況"),
-                    "clarify_from_needs": None,
-                    "clarifies_detect": [],
-                    "clarify_final": None,
-                    "fb_used": False,
                 }
             return res
 
         except Exception as e:
+            rid = _rid()
             logger.error("[%s] dev_run failed: %r\n%s", rid, e, traceback.format_exc())
             return {"status": "error", "message": str(e), "error_id": rid, "trace": traceback.format_exc()}
 
@@ -482,13 +625,11 @@ if ALLOW_DEV:
 
             from nlp_extract import extract_query
             from disambiguator import detect, apply_choice_to_query
-            from search_core import run_query_system
-            from postprocess import reorder_and_pair
+            from search_core import run_query
             from formatters import to_plain_text
 
             query, _ = extract_query(text)
 
-            # Clarify 再構築（まず _needs_choice）
             c = _clarify_from_needs_choice(query)
             if not c:
                 try:
@@ -504,11 +645,9 @@ if ALLOW_DEV:
             chs = c.get("choices", []) or []
             parsed_chosen_labels: List[str] = []
 
-            # 自然文優先
             if chosen_text:
                 parsed_chosen_labels = _parse_chosen_text(chosen_text, chs)
 
-            # 明示配列（["1","3"] or ["厚膜塗料（〜）"]）も許容
             if not parsed_chosen_labels and chosen:
                 id2label = {str(x.get("id", "")).strip(): str(x.get("label", "")).strip() for x in chs}
                 labels_set = {str(x.get("label", "")).strip() for x in chs}
@@ -521,12 +660,10 @@ if ALLOW_DEV:
                         tmp.append(s)
                 parsed_chosen_labels = tmp
 
-            # unknown の場合はおすすめ（先頭）に寄せる
             if not parsed_chosen_labels and chosen_text and _norm(chosen_text) in {"unknown", "わからない", "任せる"}:
                 if chs:
                     parsed_chosen_labels = [str(chs[0].get("label", "")).strip()]
 
-            # all の場合は全件
             if parsed_chosen_labels == ["all"]:
                 parsed_chosen_labels = [str(x.get("label", "")).strip() for x in chs if x.get("label")]
 
@@ -539,15 +676,15 @@ if ALLOW_DEV:
                     "debug": dbg if debug_flag else None,
                 }
 
-            # 反映 → 検索
             query_after = apply_choice_to_query(query, parsed_chosen_labels, c)
-            results = run_query_system(query_after)
-            results = reorder_and_pair(results, text, query_after)
-            rendered = to_plain_text(results, query_after, "(dev clarified)")
-            if not results:
-                rendered = NORESULT_MSG
+            outcome = run_query(query_after)
 
-            resp = {"status": "ok", "result_text": _with_reset_hint(rendered), "query": query_after}
+            if outcome.status != "ok":
+                rendered = outcome.message or f"status={outcome.status}"
+            else:
+                rendered = to_plain_text(outcome.singles or [], query_after, "(dev clarified)")
+
+            resp = {"status": outcome.status, "result_text": rendered, "query": query_after}
             if debug_flag:
                 resp["debug"] = {
                     "parsed_chosen": parsed_chosen_labels,
