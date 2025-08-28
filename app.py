@@ -39,11 +39,12 @@ def _norm(s: str) -> str:
 
 # 揮発セッション（メモリ）
 # user_id -> {
-#   "mode": "idle" | "await_refine",
-#   "base_query": dict,               # 最初の抽出クエリ
-#   "active_filters": Dict[col,List], # 追加絞り込み（複数回分）
-#   "last_facets": Dict[col,List],    # 直近ヒットのファセット
-#   "refine_stack": [                 # 戻る用スナップショット
+#   "mode": "idle" | "await_clarify" | "await_refine",
+#   "base_query": dict,
+#   "active_filters": Dict[col,List],
+#   "last_facets": Dict[col,List],
+#   "clarify": Dict,
+#   "refine_stack": [
 #       {"rows":[...], "query":{...}, "facets":{...}}
 #   ]
 # }
@@ -117,10 +118,10 @@ def _make_quick(items: List[Tuple[str, str]]) -> Optional[QuickReply]:
     return QuickReply(items=btns)
 
 def _qr_reset_and_exit_items() -> List[Tuple[str, str]]:
-    return [
-        ("0 リセット", "0"),
-        ("1 終了", "1"),
-    ]
+    return [("0 リセット", "0"), ("1 終了", "1")]
+
+def _qr_exit_only_items() -> List[Tuple[str, str]]:
+    return [("1 終了", "1")]
 
 def _qr_from_facets(facets: Dict[str, List[str]], per_col: int = 3) -> List[Tuple[str, str]]:
     """検索結果から得たファセットをQRに（各列最大 per_col 件）"""
@@ -131,16 +132,48 @@ def _qr_from_facets(facets: Dict[str, List[str]], per_col: int = 3) -> List[Tupl
             qr.append((_ellipsize(f"{alias}:{v}", 20), f"{col}:{v}"))
     return qr
 
-def _make_qr_for_refine(user_id: str, facets: Dict[str, List[str]]) -> List[Tuple[str, str]]:
-    """絞り込み用のQR（←戻る を含める/必要時）"""
+def _qr_for_clarify(clarify: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """
+    Clarify回答用のQR（候補＋全部＋わからない）
+    ※ここでは 0/1 を出さない（数値 1/0 の誤解釈で終了/リセットを防ぐ）
+    """
+    items: List[Tuple[str, str]] = []
+    labels = [str(c.get("label","")).strip() for c in (clarify.get("choices") or []) if c.get("label")]
+    for lab in labels[:11]:  # 11件 + 2件（全部/わからない）= 13
+        items.append((_ellipsize(lab, 20), lab))
+    items.append(("全部", "all"))
+    items.append(("わからない", "unknown"))
+    return items[:13]
+
+def _has_any_condition(query: Dict[str, Any]) -> bool:
+    """実質“条件なし（=全件）”かどうかの判別用"""
+    if not isinstance(query, dict):
+        return True
+    keys = {
+        "作業名","機械カテゴリー","ライナックス機種名","使用カッター名",
+        "作業効率評価","工程数","処理する深さ・厚さ","下地の状況",
+        "depth_value","depth_range"
+    }
+    for k in keys:
+        v = query.get(k)
+        if v:
+            if isinstance(v, (list, tuple, set, dict)):
+                if len(v) > 0:
+                    return True
+            else:
+                return True
+    return False
+
+def _make_qr_for_refine(user_id: str, facets: Dict[str, List[str]], allow_show_all: bool = False) -> List[Tuple[str, str]]:
+    """絞り込み用のQR（←戻る / 全件表示 / 候補 / 0/1）"""
     head: List[Tuple[str, str]] = []
-    # Undoが可能なときだけ「← 戻る」を先頭に
     sess = _SESS.get(user_id) or {}
     if len(sess.get("refine_stack") or []) >= 2:
         head.append(("← 戻る", "戻る"))
+    if allow_show_all:
+        head.append(("全件表示", "全件表示"))
     mid = _qr_from_facets(facets, per_col=3)
     tail = _qr_reset_and_exit_items()
-    # 13件制限に合わせて切り詰め
     room_for_mid = max(0, 13 - len(head) - len(tail))
     return head + mid[:room_for_mid] + tail
 
@@ -154,11 +187,8 @@ def _reply_text(token: str, text: str, quick_items: Optional[List[Tuple[str, str
         )
     except LineBotApiError as e:
         logger.error("LINE reply failed: %r", e)
-        # 最低限テキストだけ再送（QRが原因の400を回避）
         try:
-            line_bot_api.reply_message(
-                token, TextSendMessage(text=text[:4900])
-            )
+            line_bot_api.reply_message(token, TextSendMessage(text=text[:4900]))
         except Exception:
             pass
 
@@ -178,7 +208,41 @@ def _clarify_from_needs_choice(filters: Dict[str, Any]) -> Optional[Dict[str, An
         "question": f"「{term}」はどれですか？（複数可）",
         "choices": [{"id": str(i + 1), "label": lab} for i, lab in enumerate(cands)],
         "column": "下地の状況",
+        "term": term,
     }
+
+def _parse_clarify_answer(text: str, choices: List[Dict[str, Any]]) -> List[str]:
+    """Clarify回答（自然文/番号/ラベル/all/unknown）→ ラベル配列"""
+    t = _norm(text).strip().lower()
+    labels = [str(c.get("label","")).strip() for c in choices if c.get("label")]
+    id2label = {str(c.get("id","")).strip(): str(c.get("label","")).strip() for c in choices}
+
+    if not t:
+        return []
+
+    if t in {"all", "全部", "全て", "すべて"}:
+        return labels[:]
+    if t in {"unknown", "わからない", "任せる"}:
+        return [labels[0]] if labels else []
+
+    parts = re.split(r"[,\s，、]+", t)
+    picked: List[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if p in id2label and id2label[p]:
+            picked.append(id2label[p])
+            continue
+        for lab in labels:
+            if p == _norm(lab).lower() or p in _norm(lab).lower():
+                picked.append(lab)
+                break
+    dedup = []
+    for x in picked:
+        if x and x not in dedup:
+            dedup.append(x)
+    return dedup
 
 # ==============================
 # ファセット作成（結果から候補提示）
@@ -201,11 +265,9 @@ def _build_facets(rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
             v = (r.get(c) or "").strip()
             if not v:
                 continue
-            # カンマ/読点/空白で分割（セル内多値）
             parts = [p.strip() for p in re.split(r"[,\s、]+", v) if p.strip()]
             if parts:
                 facets[c].update(parts)
-    # 空列は削除し、ソート
     out: Dict[str, List[str]] = {}
     for c, s in facets.items():
         if s:
@@ -213,16 +275,12 @@ def _build_facets(rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
     return out
 
 def _apply_refine(base_query: Dict[str, Any], active_filters: Dict[str, List[str]]) -> Dict[str, Any]:
-    """ベースクエリに active_filters（列: 値の配列で AND）をマージ"""
     q = dict(base_query)
     for col, vals in active_filters.items():
         q[col] = list(vals)
     return q
 
 def _parse_colon_filter(text: str) -> Optional[Tuple[str, str]]:
-    """
-    '列:値' / '列＝値' / '列=値' 形式を抽出。先頭/末尾空白は無視。
-    """
     t = _norm(text).strip()
     m = re.match(r"^([^:：=＝]+)\s*[:：=＝]\s*(.+)$", t)
     if not m:
@@ -243,12 +301,12 @@ def _reset_session(user_id: str):
         _SESS.pop(user_id, None)
 
 # ==============================
-# 絞り込み “戻る” 用スナップショットユーティリティ
+# 絞り込み “戻る” 用スナップショット
 # ==============================
 def _S(uid: str) -> Dict[str, Any]:
     s = _SESS.get(uid)
     if not s:
-        s = {"mode": "idle", "base_query": {}, "active_filters": {}, "last_facets": {}, "refine_stack": []}
+        s = {"mode": "idle", "base_query": {}, "active_filters": {}, "last_facets": {}, "clarify": None, "refine_stack": []}
         _SESS[uid] = s
     if "refine_stack" not in s:
         s["refine_stack"] = []
@@ -262,7 +320,6 @@ def _current_snapshot(uid: str) -> Optional[Dict[str, Any]]:
     return st[-1] if st else None
 
 def _undo_snapshot(uid: str) -> Optional[Dict[str, Any]]:
-    """1ステップ戻る（初回より前には戻さない）。戻せたら現在のスナップショットを返す。"""
     st = _S(uid)["refine_stack"]
     if len(st) <= 1:
         return None
@@ -270,13 +327,9 @@ def _undo_snapshot(uid: str) -> Optional[Dict[str, Any]]:
     return st[-1]
 
 # ==============================
-# “前の結果をくっつけない”シンプル描画（最小パッチ）
+# “前の結果をくっつけない”描画
 # ==============================
 def _render_refined_simple(rows: List[Dict[str, Any]], header: Optional[str] = None) -> str:
-    """
-    絞り込み結果を“その時点の結果のみ”テキスト化。
-    ※ 以前の結果を下に付けないため to_plain_text は使わない。
-    """
     cols = [
         "作業名", "機械カテゴリー", "ライナックス機種名", "使用カッター名",
         "処理する深さ・厚さ", "作業効率評価", "工程数", "下地の状況"
@@ -293,7 +346,8 @@ def _render_refined_simple(rows: List[Dict[str, Any]], header: Optional[str] = N
             v = r.get(c)
             if v:
                 lines.append(f"   - {c}: {v}")
-    return "\n".join(lines)
+        lines.append("")  # 各候補の間に空行
+    return "\n".join(lines).rstrip()
 
 # ==============================
 # Webhook（LINE）
@@ -330,8 +384,8 @@ async def callback(request: Request):
         from nlp_extract import extract_query
         from disambiguator import detect, apply_choice_to_query
         from search_core import run_query_system
-        from formatters import to_plain_text
         from postprocess import reorder_and_pair
+        from formatters import to_plain_text
     except Exception as e:
         logger.error("delayed import failed: %r\n%s", e, traceback.format_exc())
         return PlainTextResponse("OK", status_code=200)
@@ -344,15 +398,96 @@ async def callback(request: Request):
             user_text_raw = (event.message.text or "")
             user_text = user_text_raw.strip()
             user_id = _sender_id_from_event(event)
-
-            # --- グローバルコマンド ---
             u = _norm(user_text)
+
+            # --- Clarify待ちを最優先で処理（ここでは 0/1 をグローバル扱いしない） ---
+            sess0 = _SESS.get(user_id) or {}
+            if sess0.get("mode") == "await_clarify":
+                clar = sess0.get("clarify") or {}
+                base_q = sess0.get("base_query") or {}
+                chs = clar.get("choices") or []
+
+                # 明示ワードでのみ終了/リセットを許可（数値 1/0 は Clarify用として扱う）
+                if u in {"終了", "終わり"}:
+                    _reset_session(user_id)
+                    _reply_text(event.reply_token, "終了しました。またどうぞ！")
+                    continue
+                if u in {"リセット", "ﾘｾｯﾄ"}:
+                    _reset_session(user_id)
+                    _reply_text(
+                        event.reply_token,
+                        "新しい検索を始めます。条件を入力してください。",
+                        quick_items=_qr_exit_only_items()
+                    )
+                    continue
+
+                parsed_labels = _parse_clarify_answer(user_text, chs)
+                if not parsed_labels:
+                    msg = "選択肢を解釈できませんでした。候補から選ぶか、番号/ラベル/『all』で入力してください。"
+                    _reply_text(event.reply_token, msg, quick_items=_qr_for_clarify(clar))
+                    continue
+
+                # Clarify反映 → 検索
+                try:
+                    query_after = apply_choice_to_query(base_q, parsed_labels, clar)
+                except Exception as e:
+                    rid = _rid()
+                    logger.error("[%s] apply_choice_to_query failed: %r\nclar=%r\nbase=%r\n", rid, e, clar, base_q)
+                    _reply_text(event.reply_token, f"選択の処理でエラーが発生しました。最初から入力し直してください。（Error ID: {rid}）")
+                    _reset_session(user_id)
+                    continue
+
+                results = run_query_system(query_after)
+                results = reorder_and_pair(results, user_text, query_after)
+
+                if not results:
+                    _reply_text(
+                        event.reply_token,
+                        "該当なしでした。もう一度検索条件を入れなおしてください。終了なら1または『終わり』『終了』と入力してください。",
+                        quick_items=_qr_reset_and_exit_items()
+                    )
+                    _reset_session(user_id)
+                    continue
+
+                facets = _build_facets(results)
+                _S(user_id)
+                _SESS[user_id]["refine_stack"] = []
+                _push_snapshot(user_id, results, query_after, facets)
+
+                allow_show_all = _has_any_condition(query_after)
+                if len(results) >= 10:
+                    _SESS[user_id]["mode"] = "await_refine"
+                    _SESS[user_id]["base_query"] = query_after
+                    _SESS[user_id]["active_filters"] = {}
+                    _SESS[user_id]["last_facets"] = facets
+                    _SESS[user_id]["clarify"] = None
+
+                    qr_items = _make_qr_for_refine(user_id, facets, allow_show_all=allow_show_all)
+                    msg = (
+                        f"検索結果が多いです（{len(results)}件）。\n"
+                        "『列:値』（例：機械:UC-500）で追加指定するか、下の候補から選んでください。"
+                    )
+                    _reply_text(event.reply_token, msg, quick_items=qr_items)
+                    continue
+
+                text_msg = _render_refined_simple(results, header="【検索結果】")
+                tail = "\n\n新しい検索を行う場合はゼロ、０、またはリセット指示をお願いします。"
+                _reply_text(event.reply_token, (text_msg + tail)[:4900], quick_items=_qr_reset_and_exit_items())
+
+                _SESS[user_id]["mode"] = "await_refine"
+                _SESS[user_id]["base_query"] = query_after
+                _SESS[user_id]["active_filters"] = {}
+                _SESS[user_id]["last_facets"] = facets
+                _SESS[user_id]["clarify"] = None
+                continue
+
+            # --- グローバルコマンド（Clarify待ち以外で有効） ---
             if u in {"0", "０", "ゼロ", "ﾘｾｯﾄ", "リセット"}:
                 _reset_session(user_id)
                 _reply_text(
                     event.reply_token,
                     "新しい検索を始めます。条件を入力してください。",
-                    quick_items=_qr_reset_and_exit_items()
+                    quick_items=_qr_exit_only_items()
                 )
                 continue
             if u in {"1", "１", "終わり", "終了"}:
@@ -360,7 +495,7 @@ async def callback(request: Request):
                 _reply_text(event.reply_token, "終了しました。またどうぞ！")
                 continue
 
-            # --- Undo（戻る）
+            # --- Undo（戻る） ---
             if u in {"戻る", "前に戻る", "前の結果", "undo", "back", "戻す", "ひとつ戻る"}:
                 snap = _undo_snapshot(user_id)
                 if not snap:
@@ -370,49 +505,53 @@ async def callback(request: Request):
                         quick_items=_qr_reset_and_exit_items()
                     )
                     continue
-                # 戻った結果を表示（現在のみ・下に前結果をくっつけない）
                 msg = _render_refined_simple(snap["rows"], header="【前の結果に戻りました】")
-                # セッションのベースをスナップショット時点に合わせる
                 s = _S(user_id)
                 s["mode"] = "await_refine"
                 s["base_query"] = snap["query"]
                 s["active_filters"] = {}
                 s["last_facets"] = snap.get("facets") or _build_facets(snap["rows"])
                 _SESS[user_id] = s
-
-                qr_items = _make_qr_for_refine(user_id, s["last_facets"])
+                qr_items = _make_qr_for_refine(user_id, s["last_facets"], allow_show_all=_has_any_condition(s["base_query"]))
                 _reply_text(event.reply_token, (msg + "\n\n条件を追加して絞り込みできます。")[:4900], quick_items=qr_items)
                 continue
 
             # --- 既に絞り込み待ち（ファセット提示済み）の場合 ---
             sess = _SESS.get(user_id) or {}
             if sess.get("mode") == "await_refine":
+                if u in {"全件表示", "全件", "全表示"}:
+                    snap = _current_snapshot(user_id)
+                    if not snap:
+                        _reply_text(event.reply_token, "全件表示できる状態ではありません。", quick_items=_qr_reset_and_exit_items())
+                        continue
+                    msg = _render_refined_simple(snap["rows"], header="【全件表示（現在の条件）】")
+                    qr_items = _make_qr_for_refine(user_id, snap.get("facets") or _build_facets(snap["rows"]),
+                                                   allow_show_all=_has_any_condition(sess.get("base_query") or {}))
+                    _reply_text(event.reply_token, (msg + "\n（長文は途中で切れる場合があります）")[:4900], quick_items=qr_items)
+                    continue
+
                 parsed = _parse_colon_filter(user_text)
                 base_query = sess.get("base_query") or {}
                 active_filters = sess.get("active_filters") or {}
 
                 if parsed:
                     col, val = parsed
-                    # 既知列名のゆれを吸収（エイリアス逆引き）
                     col_norm = col
                     for full, ali in ALIAS.items():
                         if col == ali:
                             col_norm = full
                             break
 
-                    # 追加
                     vals = active_filters.get(col_norm, [])
                     if val not in vals:
                         vals = vals + [val]
                     active_filters[col_norm] = vals
 
-                    # 再検索
                     q2 = _apply_refine(base_query, active_filters)
                     results = run_query_system(q2)
                     results = reorder_and_pair(results, user_text, q2)
 
                     if not results:
-                        # 該当なし → 案内＆リセット/終了
                         _reply_text(
                             event.reply_token,
                             "該当なしでした。もう一度検索条件を入れなおしてください。終了なら1または『終わり』『終了』と入力してください。",
@@ -422,11 +561,8 @@ async def callback(request: Request):
                         continue
 
                     facets2 = _build_facets(results)
-
-                    # 新しい状態をスタックに push（Undo 用）
                     _push_snapshot(user_id, results, q2, facets2)
 
-                    # ヒットが多いときはさらに絞り込めるように
                     if len(results) >= 10:
                         sess["mode"] = "await_refine"
                         sess["base_query"] = base_query
@@ -434,7 +570,7 @@ async def callback(request: Request):
                         sess["last_facets"] = facets2
                         _SESS[user_id] = sess
 
-                        qr_items = _make_qr_for_refine(user_id, facets2)
+                        qr_items = _make_qr_for_refine(user_id, facets2, allow_show_all=_has_any_condition(q2))
                         msg = (
                             f"検索結果が多いです（{len(results)}件）。\n"
                             "『列:値』（例：機械:UC-500）で追加指定するか、下の候補から選んでください。"
@@ -442,15 +578,13 @@ async def callback(request: Request):
                         _reply_text(event.reply_token, msg, quick_items=qr_items)
                         continue
 
-                    # ちょうど良い件数 → “現在のみ”を表示（過去は付けない）
                     text_msg = _render_refined_simple(results, header="【絞り込み結果】")
                     tail = "\n\n新しい検索を行う場合はゼロ、０、またはリセット指示をお願いします。"
                     _reply_text(
                         event.reply_token,
                         (text_msg + tail)[:4900],
-                        quick_items=_make_qr_for_refine(user_id, facets2)
+                        quick_items=_make_qr_for_refine(user_id, facets2, allow_show_all=_has_any_condition(q2))
                     )
-                    # 状態維持（さらに絞り込める）
                     sess["mode"] = "await_refine"
                     sess["base_query"] = base_query
                     sess["active_filters"] = active_filters
@@ -458,9 +592,8 @@ async def callback(request: Request):
                     _SESS[user_id] = sess
                     continue
 
-                # 形式不明 → ガイド再提示（候補QRを出し続ける）
                 facets = sess.get("last_facets") or {}
-                qr_items = _make_qr_for_refine(user_id, facets)
+                qr_items = _make_qr_for_refine(user_id, facets, allow_show_all=_has_any_condition(sess.get("base_query") or {}))
                 _reply_text(
                     event.reply_token,
                     "追加条件は『列:値』（例：機械:UC-500）の形式で入力してください。",
@@ -468,7 +601,7 @@ async def callback(request: Request):
                 )
                 continue
 
-            # --- ここから新規検索フロー ---
+            # --- 新規検索フロー ---
             # ❶ 抽出
             try:
                 query, explain = extract_query(user_text)
@@ -482,9 +615,9 @@ async def callback(request: Request):
                 )
                 continue
 
-            # ❷ Clarify 判定（まず _needs_choice）
-            clarifies = []
+            # ❷ Clarify 判定
             c_from_needs = _clarify_from_needs_choice(query)
+            clarifies = []
             if c_from_needs:
                 clarifies = [c_from_needs]
             else:
@@ -495,7 +628,6 @@ async def callback(request: Request):
 
             if clarifies:
                 c = clarifies[0]
-                # 選択肢の提示（テキスト本文に列挙）
                 lines: List[str] = []
                 qtxt = str(c.get("question") or "条件をもう少し具体化してください。")
                 lines.append(qtxt)
@@ -513,19 +645,15 @@ async def callback(request: Request):
                     "・ラベルそのものでもOK（例：厚膜塗料（エポキシ））",
                     "・全て = all / わからない = unknown も可",
                 ]
-                _reply_text(
-                    event.reply_token,
-                    "\n".join(lines),
-                    quick_items=_qr_reset_and_exit_items()
-                )
-                # Clarifyの簡易状態（必要なら実装拡張）
-                _SESS[user_id] = {
-                    "mode": "idle",
-                    "base_query": query,
-                    "active_filters": {},
-                    "last_facets": {},
-                    "refine_stack": []
-                }
+                s = _S(user_id)
+                s["mode"] = "await_clarify"
+                s["clarify"] = c
+                s["base_query"] = query
+                s["active_filters"] = {}
+                s["last_facets"] = {}
+                _SESS[user_id] = s
+
+                _reply_text(event.reply_token, "\n".join(lines), quick_items=_qr_for_clarify(c))
                 continue
 
             # ❸ 検索 → 並べ替え
@@ -551,22 +679,21 @@ async def callback(request: Request):
                 )
                 continue
 
-            # ❺ ヒット多い → ファセット提示して追加入力へ（Undo用に初回結果を push）
+            # ❺ ヒット多い → ファセット提示（初回結果をpush）
             if len(results) >= 10:
                 facets = _build_facets(results)
-
-                # セッション保存：以降の追加入力はこの条件に積み上げる
                 s = _S(user_id)
                 s["mode"] = "await_refine"
-                s["base_query"] = query         # 最初の検索条件を保持
-                s["active_filters"] = {}        # 以降の追加分
+                s["base_query"] = query
+                s["active_filters"] = {}
                 s["last_facets"] = facets
+                s["clarify"] = None
                 _SESS[user_id] = s
 
-                # 初回結果スナップショットを push（戻るの起点）
                 _push_snapshot(user_id, results, query, facets)
 
-                qr_items = _make_qr_for_refine(user_id, facets)
+                allow_show_all = _has_any_condition(query)
+                qr_items = _make_qr_for_refine(user_id, facets, allow_show_all=allow_show_all)
                 msg = (
                     f"検索結果が多いです（{len(results)}件）。\n"
                     "『列:値』（例：機械:UC-500）で追加指定するか、下の候補から選んでください。"
@@ -574,9 +701,8 @@ async def callback(request: Request):
                 _reply_text(event.reply_token, msg, quick_items=qr_items)
                 continue
 
-            # ❻ 適量ヒット → 表示（初回は従来どおり）
-            from formatters import to_plain_text  # 明示（上でimportしてるが可読のため残す）
-            text_msg = to_plain_text(results, query, explain)
+            # ❻ 適量ヒット → 表示（空行入り）
+            text_msg = _render_refined_simple(results, header="【検索結果】")
             tail = "\n\n新しい検索を行う場合はゼロ、０、またはリセット指示をお願いします。"
             _reply_text(
                 event.reply_token,
@@ -600,13 +726,6 @@ async def callback(request: Request):
 if ALLOW_DEV:
     @app.post("/dev/run")
     async def dev_run(payload: dict = Body(...)):
-        """
-        本文(text)を投げると、抽出→Clarify 判定（まず _needs_choice）→
-        - Clarify あり: clarify を返す
-        - なし: そのまま検索→整形テキストを返す
-
-        debug=true で内部状態を追加
-        """
         rid = _rid()
         try:
             text = (payload.get("text") or "").strip()
@@ -614,7 +733,6 @@ if ALLOW_DEV:
             if not text:
                 return {"status": "error", "message": "text を入れてください"}
 
-            # 遅延インポート
             from nlp_extract import extract_query
             from disambiguator import detect
             from search_core import run_query_system
@@ -623,7 +741,6 @@ if ALLOW_DEV:
 
             query, explain = extract_query(text)
 
-            # _needs_choice → Clarify
             clarify = _clarify_from_needs_choice(query)
             clarifies_detect = []
             if not clarify:
@@ -657,7 +774,6 @@ if ALLOW_DEV:
                     }
                 return res
 
-            # Clarify なし → 検索
             results = run_query_system(query)
             results = reorder_and_pair(results, text, query)
             rendered = to_plain_text(results, query, "(dev)")
@@ -681,11 +797,6 @@ if ALLOW_DEV:
 
     @app.post("/dev/choose")
     async def dev_choose(payload: dict = Body(...)):
-        """
-        /dev/run で clarify が出たときの 2段目。
-        { "text": "...", "chosen": ["2"] } でも、
-        { "text": "...", "chosen_text": "水性のほう" } でもOK。
-        """
         rid = _rid()
         try:
             text = _norm((payload.get("text") or "").strip())
@@ -704,7 +815,6 @@ if ALLOW_DEV:
 
             query, _ = extract_query(text)
 
-            # Clarify 再構築（まず _needs_choice）
             c = _clarify_from_needs_choice(query)
             if not c:
                 try:
@@ -723,7 +833,6 @@ if ALLOW_DEV:
 
             parsed_chosen_labels: List[str] = []
 
-            # 自然文優先
             if chosen_text:
                 t = _norm(chosen_text).lower()
                 if t in {"all", "全部", "全て", "すべて"}:
@@ -736,7 +845,6 @@ if ALLOW_DEV:
                             parsed_chosen_labels = [lab]
                             break
 
-            # 明示配列（["1","3"] or ["厚膜塗料（〜）"]）
             if not parsed_chosen_labels and chosen:
                 tmp: List[str] = []
                 for it in chosen:
@@ -756,7 +864,6 @@ if ALLOW_DEV:
                     "debug": dbg if debug_flag else None,
                 }
 
-            # 反映 → 検索
             query_after = apply_choice_to_query(query, parsed_chosen_labels, c)
             results = run_query_system(query_after)
             results = reorder_and_pair(results, text, query_after)
