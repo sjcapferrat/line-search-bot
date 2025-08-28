@@ -156,3 +156,27 @@ def to_flex_message(results: List[dict]) -> dict:
         }]
 
     return {"type": "carousel", "contents": bubbles}
+
+def qr_reset_and_exit():
+    return [
+        {"type":"action","action":{"type":"message","label":"新しい検索(0)","text":"0"}},
+        {"type":"action","action":{"type":"message","label":"終了(1)","text":"1"}},
+    ]
+
+def tail_reset_hint(text: str) -> str:
+    return text + "新しい検索を行う場合はゼロ、０、またはリセット指示をお願いします。"
+
+def msg_no_results():
+    return "該当なしでした。もう一度検索条件を入れなおしてください。終了なら1または『終わり』『終了』と入力してください。"
+
+def msg_invalid_conditions():
+    return "検索条件が認識されませんでした。他の入力をお願いします。"
+
+def qr_refine_or_rank():
+    return [
+        {"type":"action","action":{"type":"message","label":"他条件で絞る","text":"絞り込む"}},
+        {"type":"action","action":{"type":"message","label":"評価順(上位5)","text":"上位5"}},
+        {"type":"action","action":{"type":"message","label":"全件","text":"全件"}},
+    ]
+
+# OK 表示時の最後に tail_reset_hint() を適用

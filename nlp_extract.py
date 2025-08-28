@@ -12,15 +12,64 @@ nlp_extract.py — フル装備 + 最小パッチ + 下地の状況は最初か�
 """
 
 from __future__ import annotations
-import os
-import re
 import sys
+import re, unicodedata, os
 from pathlib import Path
+try:
+    import yaml
+except Exception: # pyyaml 無い場合でも起動は通す
+    yaml = None
+
+_SYNONYM_MAP = {}
+
+_DEF_SYNS_PATHS = [
+Path(__file__).resolve().parent / "synonyms.yaml",
+Path.cwd() / "synonyms.yaml",
+]    
+
 from functools import lru_cache
 from typing import Dict, List, Tuple, Any, Optional, Set
-
-import yaml
 import pandas as pd
+
+def _to_halfwidth(s: str) -> str:
+    return unicodedata.normalize("NFKC", s)
+
+def _normalize_hyphen(s: str) -> str:
+    return re.sub(r"[‐‑‒–—―ー−﹣－]+", "-", s) # いろいろなダッシュを半角ハイフンへ
+
+def normalize_token(s: str) -> str:
+    s = _to_halfwidth(s).strip()
+    s = _normalize_hyphen(s)
+    return s.lower()
+
+def load_synonyms() -> None:
+    global _SYNONYM_MAP
+    if yaml is None:
+        _SYNONYM_MAP = {}
+        return
+    for p in _DEF_SYNS_PATHS:
+        if p.exists():
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            table = {}
+            for canon, variants in (data.get("synonyms") or {}).items():
+                canon_n = normalize_token(canon)
+                table[canon_n] = canon_n
+                for v in variants or []:
+                    table[normalize_token(v)] = canon_n
+            _SYNONYM_MAP = table
+            break
+
+# 起動時
+load_synonyms()
+
+def apply_synonym(s: str) -> str:
+    n = normalize_token(s)
+    return _SYNONYM_MAP.get(n, n)
+
+
+# 既存のパース工程の早期段（tokenize直後）で apply_synonym() を当てる
+# 例）
+# tokens = [apply_synonym(t) for t in tokens]
 
 # ------------------------------
 # 列名

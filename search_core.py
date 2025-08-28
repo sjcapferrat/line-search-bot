@@ -1,99 +1,33 @@
-# search_core.py — フィルタを堅牢化（全角/半角・カッコ差・mm表記を吸収）＋深さの数値判定を拡張
+# search_core.py
+# CSV直フィルタの堅牢化 + 高レベルAPI(run_query)でUX分岐を提供
 from __future__ import annotations
-import os, csv, re
+
+import os
+import csv
+import re
+from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
+from dataclasses import dataclass, field
 
-# 既存のアダプタは温存（文字列クエリのときに使用）
-try:
-    from search_adapter import run_query_system as _adapter_run  # type: ignore
-except Exception:
-    _adapter_run = None  # CSV直フィルタ専用モードでも動くように
+# ==============================
+# 定数・データクラス
+# ==============================
+EVAL_ORDER = {"◎": 0, "○": 1, "〇": 1, "△": 2, "": 9}
 
-# ------- 正規化ユーティリティ -------
-def _canon_text(s: str) -> str:
-    """比較用に正規化：全角→半角, 全角カッコ→半角, 全角空白→半角, 空白除去"""
-    if s is None:
-        return ""
-    t = str(s)
-    # 全角→半角のざっくり
-    tbl = str.maketrans({
-        "（": "(", "）": ")",
-        "　": " ",
-    })
-    t = t.translate(tbl)
-    # 空白全除去（列値比較は強めに）
-    t = re.sub(r"\s+", "", t)
-    return t
+@dataclass
+class SearchOutcome:
+    status: str  # ok / invalid_conditions / no_results / range_out / need_refine
+    singles: Optional[List[Dict[str, Any]]] = None
+    pairs: Optional[List[Dict[str, Any]]] = None
+    message: Optional[str] = None
+    suggest_depth: Optional[float] = None  # mm（範囲外時の提案）
+    total_hits: Optional[int] = None
+    raw_hits: Optional[List[Dict[str, Any]]] = field(default=None)  # need_refine で利用
 
-_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
-def _to_mm_value(s: str) -> Optional[float]:
-    """
-    '1', '1.0', '1mm', '１㎜', '1 ミリ' などを float(mm) に。
-    失敗時 None。
-    """
-    if s is None:
-        return None
-    t = str(s)
-    # 単位/記号ゆれの吸収
-    t = (t.replace("㎜", "mm")
-           .replace("ＭＭ", "mm")
-           .replace("ｍｍ", "mm")
-           .replace("ｍ", "m")  # 念のため
-           # ダッシュ・チルダ類は念のため統一
-           .replace("〜", "-").replace("～", "-")
-           .replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-").replace("−", "-")
-    )
-    m = _NUM_RE.search(t)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except ValueError:
-        return None
-
-def _parse_depth_range(cell: str) -> Optional[Tuple[float, float]]:
-    """
-    行側の '0.4-1.0mm' / '0.5～1.0㎜' / '~7mm' / '3mm' などを (lo, hi) に。
-    優先順:
-      1) 範囲 a-b / a～b
-      2) 左開区間 ~b / ～b （0〜b と解釈）
-      3) 単発 3mm / 3 → (3, 3)
-    失敗時 None。
-    """
-    if not cell:
-        return None
-    raw = str(cell)
-
-    # 正規化（合字とダッシュ類）
-    t = (raw.replace("㎜", "mm")
-             .replace("〜", "~").replace("～", "~"))  # チルダ系は一旦 '~' に統一
-    t = (t.replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-").replace("−", "-"))
-
-    # 1) 範囲 a-b / a~b
-    m = re.search(r"(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)", t)
-    if m:
-        lo = float(m.group(1))
-        hi = float(m.group(2))
-        if lo > hi:
-            lo, hi = hi, lo
-        return (lo, hi)
-
-    # 2) 左開区間 ~b
-    m = re.search(r"^\s*~\s*(\d+(?:\.\d+)?)", t)
-    if m:
-        hi = float(m.group(1))
-        return (0.0, hi)
-
-    # 3) 単発（mm 有無は問わず）→ (v, v)
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm|ミリ|ﾐﾘ)?\b", t, re.IGNORECASE)
-    if m:
-        v = float(m.group(1))
-        return (v, v)
-
-    return None
-
-# ------- CSV ロード -------
+# ==============================
+# パス・CSVロード
+# ==============================
 def _csv_path() -> str:
     # 環境変数があれば最優先
     p = os.environ.get("RAG_CSV_PATH")
@@ -116,29 +50,110 @@ def _load_rows() -> List[Dict[str, str]]:
             rows.append(row)
     return rows
 
-# ------- マッチ判定（文字列） -------
+
+# ==============================
+# 正規化・深さユーティリティ
+# ==============================
+# 数値抽出（小数対応）
+_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+def _canon_text(s: str) -> str:
+    """
+    比較用に正規化：全角→半角, 全角カッコ→半角, 全角空白→半角, ダッシュ/マイナス/ハイフン類・空白を除去,
+    大文字小文字を同一視。→ Pg600 と Pg-600 の揺れを吸収。
+    """
+    if s is None:
+        return ""
+    t = str(s)
+    # 全角→半角のざっくり
+    t = t.translate(str.maketrans({"（": "(", "）": ")", "　": " "}))
+    # ダッシュ/ハイフン類は除去（記号差を吸収）
+    t = t.translate(str.maketrans({c: "" for c in "‐-‒–—―−-"}))
+    # 空白除去
+    t = re.sub(r"\s+", "", t)
+    # 統一のため小文字化
+    t = t.lower()
+    return t
+
+def _to_mm_value(s: str) -> Optional[float]:
+    """
+    '1', '1.0', '1mm', '１㎜', '1 ミリ' などを float(mm) に。
+    失敗時 None。
+    """
+    if s is None:
+        return None
+    t = str(s)
+    t = (
+        t.replace("㎜", "mm")
+         .replace("ＭＭ", "mm")
+         .replace("ｍｍ", "mm")
+         .replace("ｍ", "m")
+         .replace("〜", "-").replace("～", "-")
+         .replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-").replace("−", "-")
+    )
+    m = _NUM_RE.search(t)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+def _parse_depth_range(cell: str) -> Optional[Tuple[float, float]]:
+    """
+    行側の '0.4-1.0mm' / '0.5～1.0㎜' / '~7mm' / '3mm' などを (lo, hi) に。
+    """
+    if not cell:
+        return None
+    raw = str(cell)
+    t = (
+        raw.replace("㎜", "mm")
+           .replace("〜", "~").replace("～", "~")
+           .replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-").replace("−", "-")
+    )
+    # 1) 範囲 a-b / a~b
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        lo = float(m.group(1)); hi = float(m.group(2))
+        if lo > hi:
+            lo, hi = hi, lo
+        return (lo, hi)
+    # 2) 左開区間 ~b
+    m = re.search(r"^\s*~\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        hi = float(m.group(1))
+        return (0.0, hi)
+    # 3) 単発
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm|ミリ|ﾐﾘ)?\b", t, re.IGNORECASE)
+    if m:
+        v = float(m.group(1))
+        return (v, v)
+    return None
+
+def _range_overlap(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+    return not (a[1] < b[0] or b[1] < a[0])
+
+
+# ==============================
+# 行マッチ（AND/OR）
+# ==============================
 def _cell_contains_any(row_val: str, wants: List[str]) -> bool:
     """
-    カンマ区切り・全角/半角・カッコ差を吸収して 'OR' マッチ
+    カンマ区切り・全角/半角・カッコ差・ハイフン揺れを吸収して 'OR' マッチ
     """
     if not wants:
         return True
-    rv = _canon_text(row_val)
-    # 行側が 'A,B,C' のようなケースに対応（各要素で比較）
+    rv_norm = _canon_text(row_val)
     parts = [_canon_text(p) for p in re.split(r"[、,]", row_val or "")]
     if not parts:
-        parts = [rv]
+        parts = [rv_norm]
 
     for w in wants:
         cw = _canon_text(w)
-        # 完全一致 or 要素一致（※部分一致はここでは行わない：既存方針を踏襲）
-        if cw == rv or cw in parts:
+        # 完全一致 or 要素一致
+        if cw == rv_norm or cw in parts:
             return True
     return False
-
-# ------- 深さ判定（数値） -------
-def _range_overlap(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
-    return not (a[1] < b[0] or b[1] < a[0])
 
 def _depth_match_row(row_depth_cell: str,
                      depth_range: Optional[Tuple[float, float]],
@@ -177,7 +192,6 @@ def _depth_match_row(row_depth_cell: str,
 
     return True
 
-# ------- 1行マッチ -------
 def _row_match(row: Dict[str, str], q: Dict[str, Any]) -> bool:
     # 各キーは AND、値配列は OR
     if not _cell_contains_any(row.get("下地の状況", ""),         q.get("下地の状況", [])):         return False
@@ -185,12 +199,12 @@ def _row_match(row: Dict[str, str], q: Dict[str, Any]) -> bool:
     if not _cell_contains_any(row.get("機械カテゴリー", ""),     q.get("機械カテゴリー", [])):     return False
     if not _cell_contains_any(row.get("ライナックス機種名", ""), q.get("ライナックス機種名", [])): return False
     if not _cell_contains_any(row.get("使用カッター名", ""),     q.get("使用カッター名", [])):     return False
-    if not _cell_contains_any(row.get("工程数", ""),           q.get("工程数", [])):           return False
+    if not _cell_contains_any(row.get("工程数", ""),             q.get("工程数", [])):             return False
 
-    # --- 深さ条件（新キー優先／旧キーは後方互換） ---
+    # 深さ条件
     depth_range = q.get("depth_range")                    # 例: (lo, hi)
     depth_value = q.get("depth_value")                    # 例: 3.0
-    wants_depth_strings = q.get("処理する深さ・厚さ", [])  # 旧互換（['1', '1mm', ...]）
+    wants_depth_strings = q.get("処理する深さ・厚さ", [])  # 旧互換
 
     if not _depth_match_row(row.get("処理する深さ・厚さ", ""),
                             depth_range, depth_value, wants_depth_strings):
@@ -201,18 +215,31 @@ def _row_match(row: Dict[str, str], q: Dict[str, Any]) -> bool:
 
     return True
 
-# ------- ソート（単一工程を優先、評価は ◎>○/〇>△） -------
+
+# ==============================
+# 並び順
+# ==============================
 def _sort_key(row: Dict[str, str]) -> Tuple[int, int]:
+    # 単一工程を優先、次に評価（◎>○/〇>△）
     eng = row.get("工程数", "")
-    # 単一工程を優先（値が小さいほど先）
     k_eng = 0 if "単一" in eng else 1
-    eff = row.get("作業効率評価", "")
-    eff_norm = eff.replace("〇", "○")
-    rank_map = {"◎": 0, "○": 1, "△": 2}
-    k_eff = rank_map.get(eff_norm, 9)
+    eff = (row.get("作業効率評価", "") or "").replace("〇", "○")
+    k_eff = {"◎": 0, "○": 1, "△": 2}.get(eff, 9)
     return (k_eng, k_eff)
 
-# ------- 公開エントリ -------
+def sort_by_eval(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(rows, key=lambda r: EVAL_ORDER.get((r.get("作業効率評価", "") or ""), 9))
+
+
+# ==============================
+# 公開: 低レベル CSV フィルタ
+# ==============================
+# （自然文を直接投げたい旧経路に対応）
+try:
+    from search_adapter import run_query_system as _adapter_run  # type: ignore
+except Exception:
+    _adapter_run = None
+
 def run_query_system(query: Any) -> List[Dict[str, Any]]:
     """
     - query が dict のとき: CSV直フィルタ
@@ -220,7 +247,7 @@ def run_query_system(query: Any) -> List[Dict[str, Any]]:
             depth_range=(lo, hi)   … レンジ重なり判定
             depth_value=v          … 値の包含判定
           （従来の "処理する深さ・厚さ": ["1", "1mm", ...] も後方互換で解釈）
-    - query が str のとき: 既存アダプタ（原ロジック）へ委譲
+    - query が str のとき: 既存アダプタへ委譲
     """
     # 文字列（自然文）のまま来たら、従来アダプタへ
     if not isinstance(query, dict):
@@ -230,30 +257,125 @@ def run_query_system(query: Any) -> List[Dict[str, Any]]:
 
     rows = _load_rows()
     hits = [r for r in rows if _row_match(r, query)]
-
-    # 既定の並び: 単一工程 → 評価◎→○→△
+    # 既定の並び: 単一工程 → 評価◎→○/〇→△
     hits.sort(key=_sort_key)
-
     return hits
 
-# ------- 追加ヘルパ：ユニーク値を取得（nlp_extract から利用） -------
-def get_unique_values(column: str) -> List[str]:
+
+# ==============================
+# 高レベル API（UX分岐）
+# ==============================
+def _is_query_empty(q: Dict[str, Any]) -> bool:
     """
-    指定カラムのユニーク値（空白や読点で分割した要素も展開）を返す。
-    主に '下地の状況' などの候補提示用。
+    有効な条件が何も無ければ True。
     """
-    try:
-        rows = _load_rows()
-    except Exception:
-        return []
-    vals: set[str] = set()
-    for r in rows:
-        cell = r.get(column, "")
-        if not cell:
-            continue
-        # カンマ/全角読点/空白で分割し、個々の要素を登録
-        for part in re.split(r"[,\s、]+", str(cell)):
-            part = part.strip()
-            if part:
-                vals.add(part)
-    return sorted(vals)
+    keys_multi = ["下地の状況", "作業名", "機械カテゴリー", "ライナックス機種名",
+                  "使用カッター名", "工程数", "作業効率評価", "処理する深さ・厚さ"]
+    if any(q.get(k) for k in keys_multi):
+        return False
+    if q.get("depth_value") is not None or q.get("depth_range") is not None:
+        return False
+    return True
+
+def _remove_depth(q: Dict[str, Any]) -> Dict[str, Any]:
+    nq = dict(q)
+    nq.pop("depth_value", None)
+    nq.pop("depth_range", None)
+    # 旧互換キーも除去
+    if isinstance(nq.get("処理する深さ・厚さ"), list):
+        nq["処理する深さ・厚さ"] = []
+    return nq
+
+def _estimate_allowed_range_without_depth(q: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """
+    深さ条件を外した状態で該当行のレンジ最小/最大を推定。
+    なければ全体から推定。
+    """
+    # まずその他条件で絞る
+    base_rows = run_query_system(_remove_depth(q))
+    if not base_rows:
+        # 全体から推定
+        base_rows = _load_rows()
+
+    lows: List[float] = []
+    highs: List[float] = []
+    for r in base_rows:
+        rng = _parse_depth_range(r.get("処理する深さ・厚さ", ""))
+        if rng:
+            lows.append(rng[0]); highs.append(rng[1])
+
+    if not lows or not highs:
+        return None
+    return (min(lows), max(highs))
+
+def _format_rows(hits: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    いまはペアリング無しで singles にそのまま入れる。
+    必要があればここでグルーピング/ペア生成を実装。
+    """
+    return (hits, [])
+
+def clamp_depth(desired: float, min_mm: float, max_mm: float) -> float:
+    return max(min(desired, max_mm), min_mm)
+
+def run_query(query: Dict[str, Any]) -> SearchOutcome:
+    """
+    extract_query() からの dict を受け取り、UXに沿った分岐を行う高レベルAPI。
+    """
+    # 1) 無効条件
+    if not isinstance(query, dict) or _is_query_empty(query):
+        return SearchOutcome(
+            status="invalid_conditions",
+            message="検索条件が認識されませんでした。他の入力をお願いします。",
+            total_hits=0
+        )
+
+    # 2) 検索実行
+    hits = run_query_system(query)
+
+    # 3) 深さ指定があるときに推奨レンジ外を検出（depth_value のみを対象）
+    depth_value = query.get("depth_value")
+    if depth_value is not None:
+        est = _estimate_allowed_range_without_depth(query)
+        if est is not None:
+            min_mm, max_mm = est
+            if not (min_mm <= depth_value <= max_mm):
+                # 深さ以外の条件で再フィルタ（深さを外す）
+                hits_wo_depth = run_query_system(_remove_depth(query))
+                sdepth = clamp_depth(depth_value, min_mm, max_mm)
+                msg = "処理する深さ・厚さが推奨する幅を超えているようです。"
+                if len(hits_wo_depth) > 0:
+                    msg += f" 推奨範囲内の例として {sdepth:.1f}mm があります。再検索してみますか？"
+                return SearchOutcome(
+                    status="range_out",
+                    message=msg,
+                    suggest_depth=sdepth,
+                    total_hits=len(hits_wo_depth),
+                    raw_hits=hits_wo_depth
+                )
+
+    # 4) 該当なし
+    if not hits:
+        return SearchOutcome(
+            status="no_results",
+            message="該当なしでした。もう一度検索条件を入れなおしてください。終了なら１または「終わり」「終了」などと入力してください。",
+            total_hits=0
+        )
+
+    # 5) 多すぎる → 絞り込み or 上位5
+    if len(hits) >= 10:
+        return SearchOutcome(
+            status="need_refine",
+            message=f"検索結果数が多いです（{len(hits)}件）。他条件で絞りますか？それとも評価順の上位5件を表示しますか？",
+            total_hits=len(hits),
+            raw_hits=hits
+        )
+
+    # 6) OK（表示用に整形）
+    singles, pairs = _format_rows(hits)
+    return SearchOutcome(
+        status="ok",
+        singles=sort_by_eval(singles),
+        pairs=pairs,
+        total_hits=len(hits)
+    )
