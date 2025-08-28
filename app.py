@@ -72,7 +72,11 @@ def favicon():
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "commit": os.getenv("RENDER_GIT_COMMIT", "local"),
+        "branch": os.getenv("RENDER_GIT_BRANCH", "?")
+    }
 
 # ==============================
 # LINE 資格情報
