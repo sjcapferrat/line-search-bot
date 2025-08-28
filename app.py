@@ -420,10 +420,11 @@ class UTF8JSONResponse(JSONResponse):
         return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
 app = FastAPI(default_response_class=UTF8JSONResponse)
+APP_VERSION = "app.py (simple v2.1)"
 
 @app.get("/")
 def root():
-    return {"status": "ok", "msg": "app.py (simple v2.0)"}
+    return {"status": "ok", "msg": APP_VERSION}
 
 # ---- デバッグ用: /dev/run ----
 # リクエスト: {"user_id": "u1", "text": "検索"}
@@ -454,11 +455,45 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
 
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(event: MessageEvent):
-        user_id = event.source.user_id or "anon"
+        def _source_key(src) -> str:
+            uid = getattr(src, "user_id", None)
+            gid = getattr(src, "group_id", None)
+            rid = getattr(src, "room_id", None)
+            if uid:
+                return f"user:{uid}"
+            if gid:
+                return f"group:{gid}"
+            if rid:
+                return f"room:{rid}"
+            return "anon"
+
+        user_key = _source_key(event.source)
         text = event.message.text or ""
-        out = handle_text(user_id, text)
+        out = handle_text(user_key, text)
         quick = out.get("quick", [])
-        actions = [MessageAction(label=lbl, text=lbl) for lbl in quick[:MAX_QUICKREPLIES]]
+
+        actions = []
+        # 数字のみ選択（1..N）を基本にし、やり直す/終了はそのまま
+        pure_numeric = all(((q.strip().isdigit() and len(q.strip()) <= 2) or q in ("やり直す", "終了")) for q in quick)
+        if pure_numeric:
+            for lbl in quick[:MAX_QUICKREPLIES]:
+                actions.append(MessageAction(label=lbl, text=lbl))
+        else:
+            numbered = []
+            idx = 1
+            for q in quick:
+                if q in ("やり直す", "終了"):
+                    actions.append(MessageAction(label=q, text=q))
+                else:
+                    if len(numbered) < MAX_QUICKREPLIES:
+                        label = f"{idx}. {q}"
+                        actions.append(MessageAction(label=label, text=str(idx)))
+                        numbered.append(q)
+                        idx += 1
+            if not numbered and not actions:
+                for lbl in quick[:MAX_QUICKREPLIES]:
+                    actions.append(MessageAction(label=lbl, text=lbl))
+
         quickreply = QuickReply(items=[QuickReplyButton(action=a) for a in actions]) if actions else None
         line_bot_api.reply_message(
             event.reply_token,
