@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 nlp_extract.py — フル装備 + 最小パッチ + 下地の状況は最初からユーザー選択必須
 - synonyms.yaml は「エイリアス→正規」/「正規→[エイリアス]」両対応、YAML優先でコード内最小辞書とマージ
@@ -374,7 +374,6 @@ def _resolve_ambiguous_substrate(text: str) -> Tuple[List[str], Optional[Dict[st
         if term in t:
             if SUBSTRATE_FORCE_CHOICE:
                 return [], {"term": term, "candidates": cands}
-            # 将来、強制しない場合のヒューリスティックをここに書ける
             return [], {"term": term, "candidates": cands}
     return [], None
 

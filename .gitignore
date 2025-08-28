@@ -3,3 +3,20 @@ __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+
+# Backups
+*backup.py
+
+# Docs
+*.docx

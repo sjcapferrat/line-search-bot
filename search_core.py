@@ -235,3 +235,25 @@ def run_query_system(query: Any) -> List[Dict[str, Any]]:
     hits.sort(key=_sort_key)
 
     return hits
+
+# ------- 追加ヘルパ：ユニーク値を取得（nlp_extract から利用） -------
+def get_unique_values(column: str) -> List[str]:
+    """
+    指定カラムのユニーク値（空白や読点で分割した要素も展開）を返す。
+    主に '下地の状況' などの候補提示用。
+    """
+    try:
+        rows = _load_rows()
+    except Exception:
+        return []
+    vals: set[str] = set()
+    for r in rows:
+        cell = r.get(column, "")
+        if not cell:
+            continue
+        # カンマ/全角読点/空白で分割し、個々の要素を登録
+        for part in re.split(r"[,\s、]+", str(cell)):
+            part = part.strip()
+            if part:
+                vals.add(part)
+    return sorted(vals)
