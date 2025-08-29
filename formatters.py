@@ -51,6 +51,20 @@ def _humanize_query(query: Dict[str, Any]) -> List[str]:
         out.append(f"評価: {_join(query['作業効率評価'])}")
     return out
 
+# 並び順制御（ここを追加）
+_EFF_RANK = {"◎": 0, "○": 1, "": 3, None: 3, "△": 2}  # ◎→○→△→空（△は2とする）
+def _is_single(r: dict) -> bool:
+    s = str(r.get("工程数", "")).strip()
+    return s in ("単一", "単一工程")
+
+def _sort_for_view(rows: List[dict]) -> List[dict]:
+    def key(r: dict):
+        single_rank = 0 if _is_single(r) else 1
+        eff = _eff_norm(r.get("作業効率評価", "") or "")
+        eff_rank = _EFF_RANK.get(eff, 3)
+        return (single_rank, eff_rank)
+    return sorted(rows, key=key)
+
 def _render_line(r: dict) -> str:
     eff   = _eff_norm(r.get("作業効率評価", ""))
     mech  = r.get("ライナックス機種名", "") or "-"
@@ -60,9 +74,10 @@ def _render_line(r: dict) -> str:
     depth = r.get("処理する深さ・厚さ", "") or "-"
     steps = r.get("工程数", "")
     steps_sfx = f" / 工程: {steps}" if steps else ""
+    prefix = "（ペア候補）" if r.get("_pair_candidate") else ""
     # 例）◎ K-200ENV + ブロックチップⅡ | 塗膜や堆積物の除去 / 厚膜塗料（エポキシ） / 厚さ 0.5–1.0mm / 工程: 単一
     return (
-        f"{eff or '・'} {mech} + {cutter} | "
+        f"{prefix}{eff or '・'} {mech} + {cutter} | "
         f"{job} / {sub} / {depth}{steps_sfx}"
     )
 
@@ -71,48 +86,57 @@ def _render_line(r: dict) -> str:
 def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> str:
     """
     人に読みやすいテキスト整形。
-    - 頭に“抽出条件”の要約（箇条書き）
-    - ヒット件数と評価の内訳
-    - 並びは search_core.py のソート結果をそのまま
-    - 多すぎる場合は先頭30件のみ表示（LINE 文字数対策）
+    変更点：
+      - 先頭の件数見出しを「＝＝＝検索結果＝＝＝{件数}件」に統一
+      - 見出しのあとに1行の空行
+      - 並びは「単一工程を最優先 → ◎→○→△→空」に再ソート（formatters側で安全に実施）
+      - ペア候補（_pair_candidate=True）は先頭に「（ペア候補）」を表示
+    既存仕様：
+      - 多すぎる場合は先頭30件のみ表示（LINE 文字数対策）
+      - 抽出条件の要約や評価内訳は維持（末尾に）
     """
-    # 条件の人間向け要約
-    qlines = _humanize_query(query)
-    header = "🔎 抽出条件\n" + ("\n".join(f"・{ln}" for ln in qlines) if qlines else "・（特になし）")
+    # 並び順をここで安全に確定
+    ordered = _sort_for_view(results or [])
+    total = len(ordered)
 
-    # 件数サマリ
-    total = len(results)
-    g, s, w = _count_by_eff(results)
-    summary = f"\n\n📊 該当 {total} 件（内訳: ◎{g} / ○{s} / △{w}）"
+    # 件数見出し（ユーザー要望の書式）
+    header_results = f"＝＝＝検索結果＝＝＝{total}件"
 
-    # リスト本文
     if total == 0:
-        body = "\n\n該当するレコードは見つかりませんでした。条件を少し緩めて再検索してみてください。"
-        note = "\n"
+        # 条件サマリは既存のまま残す
+        qlines = _humanize_query(query)
+        header_query = "🔎 抽出条件\n" + ("\n".join(f"・{ln}" for ln in qlines) if qlines else "・（特になし）")
         legend = "※ 評価の意味: ◎=非常に適, ○=適, △=一部条件で可\n"
-        # explain があれば最後に小さく添える
         ex = f"（{explain}）" if explain else ""
-        return f"{header}{summary}{body}\n{legend}{ex}".strip()
+        return f"{header_results}\n\n該当するレコードは見つかりませんでした。\n{legend}{ex}\n\n{header_query}".strip()
 
-    SHOW_MAX = 30  # LINE の文字数安全圏
-    shown = results[:SHOW_MAX]
+    # 上限30件表示（既存踏襲）
+    SHOW_MAX = 30
+    shown = ordered[:SHOW_MAX]
     lines = [_render_line(r) for r in shown]
-    more = ""
-    if total > SHOW_MAX:
-        more = f"\n…ほか {total - SHOW_MAX} 件"
+    more = f"\n…ほか {total - SHOW_MAX} 件" if total > SHOW_MAX else ""
 
+    # 参考情報（従来の要約と内訳も最後に残す）
+    qlines = _humanize_query(query)
+    header_query = "🔎 抽出条件\n" + ("\n".join(f"・{ln}" for ln in qlines) if qlines else "・（特になし）")
+    g, s, w = _count_by_eff(ordered)
+    summary_tail = f"\n\n📊 内訳: ◎{g} / ○{s} / △{w}"
     legend = "\n\n※ 評価の意味: ◎=非常に適, ○=適, △=一部条件で可"
-    # explain を補助情報として末尾に（冗長にならないよう括弧で）
     ex = f"\n（{explain}）" if explain else ""
 
-    return f"{header}{summary}\n\n" + "\n".join(lines) + more + legend + ex
+    # 見出し → 空行 → 本文
+    return (
+        f"{header_results}\n\n" + "\n".join(lines) + more +
+        legend + ex + "\n\n" + header_query + summary_tail
+    )
 
 def to_flex_message(results: List[dict]) -> dict:
     """
     LINEのFlex Message用（上位10件）。
+    （最小変更）ペア候補の印だけタイトルの頭に付与
     """
     bubbles = []
-    for r in results[:10]:
+    for r in (results or [])[:10]:
         eff   = _eff_norm(r.get("作業効率評価",""))
         mech  = r.get("ライナックス機種名","") or "-"
         cutter= r.get("使用カッター名","") or "-"
@@ -120,6 +144,7 @@ def to_flex_message(results: List[dict]) -> dict:
         sub   = r.get("下地の状況","") or "-"
         depth = r.get("処理する深さ・厚さ","") or "-"
         steps = r.get("工程数","")
+        prefix = "（ペア候補）" if r.get("_pair_candidate") else ""
 
         subtitle = f"{job} / {sub}"
         depth_line = f"{depth}"
@@ -135,7 +160,7 @@ def to_flex_message(results: List[dict]) -> dict:
                 "contents": [
                     {
                         "type":"text",
-                        "text": f"{eff or '・'} {mech} + {cutter}",
+                        "text": f"{prefix}{eff or '・'} {mech} + {cutter}",
                         "weight":"bold",
                         "wrap": True
                     },
@@ -178,5 +203,3 @@ def qr_refine_or_rank():
         {"type":"action","action":{"type":"message","label":"評価順(上位5)","text":"上位5"}},
         {"type":"action","action":{"type":"message","label":"全件","text":"全件"}},
     ]
-
-# OK 表示時の最後に tail_reset_hint() を適用

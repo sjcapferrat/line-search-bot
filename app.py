@@ -1,29 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-app.py（シンプル版 v2.3）
+app.py（シンプル版 v2.4）
 
-変更点（v2.2 → v2.3）
-- START_TEXT 定数で初期表示テキストを一元管理（実改行混入の構文エラーを防止）
-- /callback の Verify（空 events）を常に即 200 で高速応答
-- それ以外は署名検証の上で handler.handle()
-- 既存の: UTF-8 JSON, QuickReply 個数制限, label20文字制限, 数字送信, 出現順候補など維持
+追加点（v2.3 → v2.4）
+- formatters.to_plain_text を採用：見出し「＝＝＝検索結果＝＝＝N件」＋直後に空行＋（ペア候補）表示
+- search_core.prepare_with_pairs で、機械カテゴリ/機種で絞った後でも前段ヒットから対工程を補完
+- 並び順は「単一工程 → ◎ → ○(〇) → △ → 空」を formatters 側で確定
 
-＋ この版で追加（招待＋id対応）
-- ALLOWED_USER_IDS（環境変数, カンマ区切り）でホワイトリスト制
-- 1:1以外（グループ/ルーム）は案内だけ返して終了
-- 「id / uid / ユーザーid」を受けたら userId を返信
-- /health は GET/HEAD/POST すべて200
-- dev_run でも "id" を送ると user_id を返す（ローカル検証用）
-
-起動例:
-  uvicorn app:app --host 0.0.0.0 --port 8000
-
-依存:
-  fastapi, uvicorn, pandas, (line-bot-sdk: 本番LINE利用時のみ)
-環境変数:
-  RAG_CSV_PATH=.../restructured_file.csv
-  LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET（LINE連携時のみ）
-  ALLOWED_USER_IDS（任意・カンマ区切り。設定時はホワイトリスト制）
+既存の会話フローや QuickReply 制御は従来通り。
 """
 from __future__ import annotations
 import os
@@ -34,6 +18,10 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 import pandas as pd
+
+# === New: 表示とペア補完ユーティリティ ===
+from formatters import to_plain_text  # 件数ヘッダ・空行・並び順・（ペア候補）表示
+from search_core import prepare_with_pairs  # ペア候補を未絞り込み結果から補完
 
 # ====== LINE SDK（未設定ならダミーで起動可能） ======
 try:
@@ -53,15 +41,14 @@ except Exception:
 CSV_PATH = os.environ.get("RAG_CSV_PATH", "restructured_file.csv")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-# 招待制ホワイトリスト（カンマ区切り: Uxxxx,Uyyyy,... ／未設定なら誰でも利用可）
 ALLOWED_USER_IDS = set(u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",") if u.strip())
 
-MAX_QUICKREPLIES = 12   # 端末差を考慮して 12 に制限（LINEは13前後が上限）
+MAX_QUICKREPLIES = 12
 RESULTS_REFINE_THRESHOLD = 5
-APP_VERSION = "app.py (simple v2.3)"
+APP_VERSION = "app.py (simple v2.4)"
 
 # =============================
-# UTF-8 JSON（PowerShell/LINEでの文字化け対策）
+# UTF-8 JSON
 # =============================
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
@@ -100,8 +87,6 @@ def load_dataframe(path: str) -> pd.DataFrame:
 
 DF = load_dataframe(CSV_PATH)
 
-# ユニーク値（出現順）
-
 def _unique_in_order(series: pd.Series) -> List[str]:
     return [x for x in pd.unique(series.tolist()) if str(x) != ""]
 
@@ -129,16 +114,12 @@ def to_int_or_none(text: str) -> Optional[int]:
             return None
     return None
 
-# QuickReply 生成ヘルパ
-
 def assemble_quick(options: List[str], controls: List[str] | Tuple[str, ...] = ()) -> List[str]:
-    """候補 + コントロールを常に MAX_QUICKREPLIES 以内に丸める"""
     controls = [c for c in controls if c]
     limit_for_options = max(0, MAX_QUICKREPLIES - len(controls))
     return options[:limit_for_options] + controls
 
 def clip_label(label: str, maxlen: int = 20) -> str:
-    """QuickReply の label は 20 文字以内。超過は『…』で丸める。"""
     return label if len(label) <= maxlen else (label[: maxlen - 1] + "…")
 
 # =============================
@@ -164,6 +145,8 @@ class SearchSession:
             "ライナックス機種名": None,
         }
         self.last_results: Optional[pd.DataFrame] = None
+        # New: ペア補完用に「未絞り込み（=作業名+下地）」の直近ヒットを保持
+        self.last_unfiltered_hits: List[Dict] = []
 
     def reset(self):
         self.__init__()
@@ -178,9 +161,8 @@ def get_session(user_key: str) -> SearchSession:
     return sess
 
 # =============================
-# 検索ロジック
+# 検索ロジック（pandasベースは維持）
 # =============================
-
 def apply_filters(df: pd.DataFrame, filters: Dict[str, Optional[str]]) -> pd.DataFrame:
     q = df.copy()
     for key, val in filters.items():
@@ -188,43 +170,38 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, Optional[str]]) -> pd.Dat
             q = q[q[key] == val]
     return q
 
+# --- New: formatters に渡すための query dict を生成（リスト形式で） ---
+def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
+    def _as_list(v: Optional[str]) -> List[str]:
+        return [v] if v else []
+    return {
+        "作業名": _as_list(sess.filters.get("作業名")),
+        "下地の状況": _as_list(sess.filters.get("下地の状況")),
+        "機械カテゴリー": _as_list(sess.filters.get("機械カテゴリー")),
+        "ライナックス機種名": _as_list(sess.filters.get("ライナックス機種名")),
+        # 深さ系は今回 UI から直接入れていないため省略（将来拡張時に付与）
+        "処理する深さ・厚さ": [],
+        "作業効率評価": [],
+        "工程数": [],
+    }
 
-def result_to_text(rows: pd.DataFrame, limit: int = 20) -> str:
-    if rows.empty:
-        return "該当がありませんでした。選び直してください。"
-    view = rows[[
-        "作業名",
-        "下地の状況",
-        "ライナックス機種名",
-        "使用カッター名",
-        "工程数",
-        "作業効率評価",
-        "処理する深さ・厚さ",
-    ]].head(limit)
-    lines = ["=== 検索結果 ==="]
-    for _, r in view.iterrows():
-        lines.append(
-            f"・{r['作業名']}｜{r['下地の状況']}｜{r['ライナックス機種名']}｜{r['使用カッター名']}｜{r['工程数']}｜{r['作業効率評価']}｜{r['処理する深さ・厚さ']}"
-        )
-    count = len(rows)
-    if count > limit:
-        lines.append(f"(他 {count - limit} 件)")
-    return "\n".join(lines)
+# --- New: 結果のテキストを生成（ペア補完＋並び順＋件数ヘッダは formatters に任せる） ---
+def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
+    # 前段（未絞り込み）は「作業名＋下地」のみ適用
+    base_filters = {k: v for k, v in sess.filters.items() if k in ("作業名", "下地の状況")}
+    prev_df = apply_filters(DF, base_filters)
+    prev_rows = prev_df.to_dict(orient="records")
+    sess.last_unfiltered_hits = prev_rows  # セッションにも保存
 
+    # 現在の表示対象
+    cur_rows = filtered_df.to_dict(orient="records")
 
-def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) -> Tuple[str, List[str]]:
-    # 使っていない軸を優先
-    if used_optional == "機械カテゴリー":
-        order = ["ライナックス機種名", "作業効率評価", "工程数"]
-    elif used_optional == "ライナックス機種名":
-        order = ["機械カテゴリー", "作業効率評価", "工程数"]
-    else:
-        order = ["機械カテゴリー", "ライナックス機種名", "作業効率評価", "工程数"]
-    for col in order:
-        vals = [x for x in rows[col].unique().tolist() if x]
-        if len(vals) >= 2:
-            return col, vals
-    return "", []
+    # ペア候補を補完して並び順を確定
+    augmented = prepare_with_pairs(cur_rows, prev_rows)
+
+    # 件数ヘッダ/空行/（ペア候補）/凡例などは formatters に任せる
+    qdict = _make_query_for_formatters(sess)
+    return to_plain_text(augmented, qdict, explain="")
 
 # =============================
 # ダイアログ制御
@@ -234,7 +211,6 @@ WELCOME = (
     "・まず『作業名』を選択してください。\n"
     "（ヒント: 途中で『やり直す』『終了』と入力できます）"
 )
-
 ASK_TASK = "作業名を選んでください"
 ASK_BASE = "下地の状況を選んでください"
 ASK_OPTIONAL = (
@@ -245,9 +221,7 @@ ASK_OPTIONAL = (
 )
 ASK_MACHINE_CAT = "機械カテゴリーを選んでください"
 ASK_MODEL = "ライナックス機種名を選んでください"
-
 START_TEXT = WELCOME + "\n\n" + ASK_TASK
-
 
 def _used_optional(sess: SearchSession) -> Optional[str]:
     if sess.filters.get("機械カテゴリー"):
@@ -256,16 +230,13 @@ def _used_optional(sess: SearchSession) -> Optional[str]:
         return "ライナックス機種名"
     return None
 
-
 def _unique_filtered(column: str, sess: SearchSession) -> List[str]:
-    # 必須条件（作業名/下地）だけを仮適用して候補を出す
     tmp_filters = {k: v for k, v in sess.filters.items() if v and k in ("作業名", "下地の状況")}
     sub = apply_filters(DF, tmp_filters)
     vals = [x for x in sub[column].unique().tolist() if x]
     if not vals:
         vals = ALL_UNIQUE[column]
     return vals
-
 
 def resolve_choice(text: str, options: List[str]) -> Optional[str]:
     t = (text or "").strip()
@@ -280,7 +251,22 @@ def resolve_choice(text: str, options: List[str]) -> Optional[str]:
             return opt
     return None
 
+def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) -> Tuple[str, List[str]]:
+    if used_optional == "機械カテゴリー":
+        order = ["ライナックス機種名", "作業効率評価", "工程数"]
+    elif used_optional == "ライナックス機種名":
+        order = ["機械カテゴリー", "作業効率評価", "工程数"]
+    else:
+        order = ["機械カテゴリー", "ライナックス機種名", "作業効率評価", "工程数"]
+    for col in order:
+        vals = [x for x in rows[col].unique().tolist() if x]
+        if len(vals) >= 2:
+            return col, vals
+    return "", []
 
+# =============================
+# 検索→表示（必要箇所のみ差し替え）
+# =============================
 def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str]) -> Dict[str, object]:
     results = apply_filters(DF, sess.filters)
     sess.last_results = results
@@ -296,29 +282,31 @@ def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str
         sess.stage = Stage.REFINE_MORE
         col, vals = next_refine_suggestions(results, used_optional)
         if not col or not vals:
+            # ここは即表示へ（ペア候補付きで）
             sess.stage = Stage.SHOW_RESULTS
-            return {"text": result_to_text(results), "quick": ["やり直す", "終了"]}
+            return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
         return {
             "text": f"該当 {len(results)} 件。『{col}』で更に絞り込めます。",
             "quick": assemble_quick(vals, ["やり直す", "終了"]),
         }
 
+    # 少件数はすぐ表示（ペア候補付き）
     sess.stage = Stage.SHOW_RESULTS
-    return {"text": result_to_text(results), "quick": ["やり直す", "終了"]}
+    return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
 
-
+# =============================
+# テキストハンドラ
+# =============================
 def handle_text(user_key: str, text: str) -> Dict[str, object]:
     sess = get_session(user_key)
     t = (text or "").strip()
 
     if t.lower() in ("id", "uid") or t in ("ユーザーid", "ユーザid"):
-        # user_key が 'user:Uxxxxxxxx' 形式のときも素で渡されたときも拾えるように
         uid = user_key
         if uid.startswith("user:"):
             uid = uid[len("user:"):]
         return {"text": f"あなたの userId は:\n{uid}", "quick": ["検索"]}
 
-    # 共通コマンド
     if t in ("終了", "exit", "quit"):
         sess.reset()
         return {"text": "終了しました。いつでも『検索』で再開できます。", "quick": ["検索"]}
@@ -327,12 +315,10 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         sess.stage = Stage.CHOOSE_TASK
         return {"text": START_TEXT, "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"])}
 
-    # 初回起点
     if sess.stage == Stage.IDLE:
         sess.stage = Stage.CHOOSE_TASK
         return {"text": START_TEXT, "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"])}
 
-    # 作業名選択
     if sess.stage == Stage.CHOOSE_TASK:
         choice = resolve_choice(t, ALL_UNIQUE["作業名"])
         if not choice:
@@ -347,7 +333,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             "quick": assemble_quick(_unique_filtered("下地の状況", sess), ["やり直す", "終了"]),
         }
 
-    # 下地の状況選択
     if sess.stage == Stage.CHOOSE_BASE:
         base_options = _unique_filtered("下地の状況", sess)
         choice = resolve_choice(t, base_options)
@@ -360,7 +345,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         sess.stage = Stage.ASK_OPTIONAL
         return {"text": f"『{choice}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
 
-    # 任意絞込の種類
     if sess.stage == Stage.ASK_OPTIONAL:
         n = to_int_or_none(t)
         if n == 1:
@@ -380,7 +364,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         else:
             return {"text": "1/2/3 のいずれかを選んでください。\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
 
-    # 機械カテゴリー
     if sess.stage == Stage.CHOOSE_MACHINE_CAT:
         options = _unique_filtered("機械カテゴリー", sess)
         choice = resolve_choice(t, options)
@@ -392,7 +375,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         sess.filters["機械カテゴリー"] = choice
         return _do_search_and_maybe_refine(sess, used_optional="機械カテゴリー")
 
-    # 機種
     if sess.stage == Stage.CHOOSE_MODEL:
         options = _unique_filtered("ライナックス機種名", sess)
         choice = resolve_choice(t, options)
@@ -404,12 +386,11 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         sess.filters["ライナックス機種名"] = choice
         return _do_search_and_maybe_refine(sess, used_optional="ライナックス機種名")
 
-    # 多件時の追加絞込
     if sess.stage == Stage.REFINE_MORE:
         col, vals = next_refine_suggestions(sess.last_results, _used_optional(sess))
         if not col or not vals:
             sess.stage = Stage.SHOW_RESULTS
-            return {"text": result_to_text(sess.last_results), "quick": ["やり直す", "終了"]}
+            return {"text": build_results_text(sess, sess.last_results), "quick": ["やり直す", "終了"]}
         choice = resolve_choice(t, vals)
         if not choice:
             return {"text": f"『{col}』から選んでください。", "quick": assemble_quick(vals, ["やり直す", "終了"])}
@@ -422,13 +403,11 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             }
         else:
             sess.stage = Stage.SHOW_RESULTS
-            return {"text": result_to_text(filtered), "quick": ["やり直す", "終了"]}
+            return {"text": build_results_text(sess, filtered), "quick": ["やり直す", "終了"]}
 
-    # 結果表示中
     if sess.stage == Stage.SHOW_RESULTS:
         return {"text": "新しい検索を始めるには『やり直す』を送ってください。", "quick": ["やり直す", "終了"]}
 
-    # フォールバック
     sess.stage = Stage.CHOOSE_TASK
     return {"text": START_TEXT, "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"])}
 
@@ -439,20 +418,16 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 def root():
     return {"status": "ok", "msg": APP_VERSION}
 
-@app.api_route("/health", methods=["GET", "HEAD", "POST"])  # 監視ツール対策
+@app.api_route("/health", methods=["GET", "HEAD", "POST"])
 def health():
     return {"ok": True}
 
-# デバッグ用 API
-# リクエスト: {"user_id": "u1", "text": "検索"}
-# レスポンス: {"text": "...", "quick": ["..."]}
 @app.post("/dev/run")
 async def dev_run(req: Request):
     body = await req.json()
     user_id = str(body.get("user_id", "dev"))
     text = str(body.get("text", ""))
 
-    # dev用ショートカット："id" で user_id を返す
     t = (text or "").strip()
     if t.lower() in ("id", "uid") or t in ("ユーザーid", "ユーザid"):
         return UTF8JSONResponse({"text": f"(dev) your user_id: {user_id}", "quick": []})
@@ -467,19 +442,15 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
 
     @app.post("/callback")
     async def callback(request: Request):
-        # 1) ボディ取得
         body_bytes = await request.body()
         body_text = body_bytes.decode("utf-8")
-        # 2) Verify（空 events）は即200
         try:
             data = json.loads(body_text)
             if isinstance(data, dict) and data.get("events") == []:
                 return PlainTextResponse("OK", status_code=200)
         except Exception:
-            # 読めない場合でも Verify などの疎通用途では 200 即返し
             return PlainTextResponse("OK", status_code=200)
 
-        # 3) 通常イベントは署名検証
         signature = request.headers.get("X-Line-Signature", "")
         try:
             handler.handle(body_text, signature)
@@ -489,7 +460,6 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
 
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(event: MessageEvent):
-        # セッションキー：1:1/グループ/ルームの別を吸収
         def _source_key(src) -> str:
             uid = getattr(src, "user_id", None)
             gid = getattr(src, "group_id", None)
@@ -502,14 +472,12 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
                 return f"room:{rid}"
             return "anon"
 
-        # === 送信元取得＆ログ
         src = event.source
         uid = getattr(src, "user_id", None)
         gid = getattr(src, "group_id", None)
         rid = getattr(src, "room_id", None)
         print(f"[EVENT] uid={uid} gid={gid} rid={rid}")
 
-        # グループ/ルームは案内だけ返して終了（1:1のみ運用）
         if gid or rid:
             try:
                 line_bot_api.reply_message(
@@ -522,7 +490,6 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
         raw_text = event.message.text or ""
         t = raw_text.strip()
 
-        # (A) テスター向けショートカット：id/uid/ユーザーid
         if t.lower() in ("id", "uid") or t in ("ユーザーid", "ユーザid"):
             try:
                 line_bot_api.reply_message(
@@ -532,7 +499,6 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
             finally:
                 return
 
-        # (B) ホワイトリスト（設定時のみ有効）
         if ALLOWED_USER_IDS and uid and uid not in ALLOWED_USER_IDS:
             try:
                 line_bot_api.reply_message(
@@ -543,11 +509,9 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
                 print(f"[DENY] uid={uid}")
                 return
 
-        # (C) 通常フロー
         user_key = _source_key(src)
         out = handle_text(user_key, raw_text)
 
-        # QuickReply を数値送信に統一（長文は20字へ丸め）
         quick = out.get("quick", [])
         actions: List[MessageAction] = []
         pure_numeric = all(((q.strip().isdigit() and len(q.strip()) <= 2) or q in ("やり直す", "終了")) for q in quick)

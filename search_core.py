@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 from dataclasses import dataclass, field
+from collections import defaultdict
 
 # ==============================
 # 定数・データクラス
@@ -379,3 +380,87 @@ def run_query(query: Dict[str, Any]) -> SearchOutcome:
         pairs=pairs,
         total_hits=len(hits)
     )
+
+
+# ==============================
+# 追加：ペア候補ユーティリティ（最小パッチ）
+# ==============================
+def _pair_key(r: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """
+    対工程の一致判定キー。
+    - 作業ID があればそれを最優先で使う（存在しなければ空文字）
+    - なければ「作業名 / 下地の状況 / 処理する深さ・厚さ」で判定
+    """
+    work_id = str(r.get("作業ID", "") or "").strip()
+    if work_id:
+        return (work_id, "", "", "")
+    return (
+        str(r.get("作業名", "")).strip(),
+        str(r.get("下地の状況", "")).strip(),
+        str(r.get("処理する深さ・厚さ", "")).strip(),
+        ""  # 長さ合わせ用
+    )
+
+def build_stage_index(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str, str, str], Dict[str, List[Dict[str, Any]]]]:
+    """
+    未フィルタ候補を、キーごとに 一次工程 / 二次工程 / 単一 に分類して保持。
+    """
+    idx: Dict[Tuple[str, str, str, str], Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: {"一次工程": [], "二次工程": [], "単一": []})
+    for r in rows or []:
+        key = _pair_key(r)
+        stage = str(r.get("工程数", "")).strip()
+        if stage == "一次工程":
+            idx[key]["一次工程"].append(r)
+        elif stage == "二次工程":
+            idx[key]["二次工程"].append(r)
+        else:
+            idx[key]["単一"].append(r)
+    return idx
+
+def augment_with_pair_candidates(current_rows: List[Dict[str, Any]],
+                                 previous_unfiltered_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    機械カテゴリー/機種などで絞り込んだあとの current_rows に対し、
+    直前の未絞り込み候補 previous_unfiltered_rows から「反対側工程」を（ペア候補）として追記する。
+    - 片側が一次工程なら二次工程を、二次工程なら一次工程を全件追加
+    - 重複は抑止（完全一致シグネチャで管理）
+    """
+    if not current_rows or not previous_unfiltered_rows:
+        return current_rows or []
+
+    prev_idx = build_stage_index(previous_unfiltered_rows)
+    augmented = list(current_rows)
+    seen = set()
+
+    for r in current_rows:
+        stage = str(r.get("工程数", "")).strip()
+        if stage not in ("一次工程", "二次工程"):
+            continue
+        key = _pair_key(r)
+        want = "二次工程" if stage == "一次工程" else "一次工程"
+        candidates = prev_idx.get(key, {}).get(want, [])
+        for c in candidates:
+            sig = (
+                c.get("作業ID",""), c.get("作業名",""), c.get("下地の状況",""),
+                c.get("処理する深さ・厚さ",""), c.get("工程数",""),
+                c.get("ライナックス機種名",""), c.get("使用カッター名","")
+            )
+            if sig in seen:
+                continue
+            seen.add(sig)
+            cc = dict(c)
+            cc["_pair_candidate"] = True
+            augmented.append(cc)
+
+    return augmented
+
+def prepare_with_pairs(filtered_hits: List[Dict[str, Any]],
+                       previous_unfiltered_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    外部（app.py等）から使う想定のラッパ。
+    - ペア候補を付与
+    - 既存の画面向けソート（単一優先→評価）を適用して返す
+    """
+    augmented = augment_with_pair_candidates(filtered_hits, previous_unfiltered_hits)
+    augmented.sort(key=_sort_key)
+    return augmented
