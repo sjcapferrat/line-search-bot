@@ -8,6 +8,13 @@ app.py（シンプル版 v2.3）
 - それ以外は署名検証の上で handler.handle()
 - 既存の: UTF-8 JSON, QuickReply 個数制限, label20文字制限, 数字送信, 出現順候補など維持
 
+＋ この版で追加（招待＋id対応）
+- ALLOWED_USER_IDS（環境変数, カンマ区切り）でホワイトリスト制
+- 1:1以外（グループ/ルーム）は案内だけ返して終了
+- 「id / uid / ユーザーid」を受けたら userId を返信
+- /health は GET/HEAD/POST すべて200
+- dev_run でも "id" を送ると user_id を返す（ローカル検証用）
+
 起動例:
   uvicorn app:app --host 0.0.0.0 --port 8000
 
@@ -16,6 +23,7 @@ app.py（シンプル版 v2.3）
 環境変数:
   RAG_CSV_PATH=.../restructured_file.csv
   LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET（LINE連携時のみ）
+  ALLOWED_USER_IDS（任意・カンマ区切り。設定時はホワイトリスト制）
 """
 from __future__ import annotations
 import os
@@ -45,6 +53,8 @@ except Exception:
 CSV_PATH = os.environ.get("RAG_CSV_PATH", "restructured_file.csv")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+# 招待制ホワイトリスト（カンマ区切り: Uxxxx,Uyyyy,... ／未設定なら誰でも利用可）
+ALLOWED_USER_IDS = set(u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",") if u.strip())
 
 MAX_QUICKREPLIES = 12   # 端末差を考慮して 12 に制限（LINEは13前後が上限）
 RESULTS_REFINE_THRESHOLD = 5
@@ -91,6 +101,7 @@ def load_dataframe(path: str) -> pd.DataFrame:
 DF = load_dataframe(CSV_PATH)
 
 # ユニーク値（出現順）
+
 def _unique_in_order(series: pd.Series) -> List[str]:
     return [x for x in pd.unique(series.tolist()) if str(x) != ""]
 
@@ -119,6 +130,7 @@ def to_int_or_none(text: str) -> Optional[int]:
     return None
 
 # QuickReply 生成ヘルパ
+
 def assemble_quick(options: List[str], controls: List[str] | Tuple[str, ...] = ()) -> List[str]:
     """候補 + コントロールを常に MAX_QUICKREPLIES 以内に丸める"""
     controls = [c for c in controls if c]
@@ -299,6 +311,13 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
     sess = get_session(user_key)
     t = (text or "").strip()
 
+    if t.lower() in ("id", "uid") or t in ("ユーザーid", "ユーザid"):
+        # user_key が 'user:Uxxxxxxxx' 形式のときも素で渡されたときも拾えるように
+        uid = user_key
+        if uid.startswith("user:"):
+            uid = uid[len("user:"):]
+        return {"text": f"あなたの userId は:\n{uid}", "quick": ["検索"]}
+
     # 共通コマンド
     if t in ("終了", "exit", "quit"):
         sess.reset()
@@ -420,7 +439,7 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 def root():
     return {"status": "ok", "msg": APP_VERSION}
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD", "POST"])  # 監視ツール対策
 def health():
     return {"ok": True}
 
@@ -432,6 +451,12 @@ async def dev_run(req: Request):
     body = await req.json()
     user_id = str(body.get("user_id", "dev"))
     text = str(body.get("text", ""))
+
+    # dev用ショートカット："id" で user_id を返す
+    t = (text or "").strip()
+    if t.lower() in ("id", "uid") or t in ("ユーザーid", "ユーザid"):
+        return UTF8JSONResponse({"text": f"(dev) your user_id: {user_id}", "quick": []})
+
     out = handle_text(user_id, text)
     return UTF8JSONResponse(out)
 
@@ -477,9 +502,50 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
                 return f"room:{rid}"
             return "anon"
 
-        user_key = _source_key(event.source)
-        text = event.message.text or ""
-        out = handle_text(user_key, text)
+        # === 送信元取得＆ログ
+        src = event.source
+        uid = getattr(src, "user_id", None)
+        gid = getattr(src, "group_id", None)
+        rid = getattr(src, "room_id", None)
+        print(f"[EVENT] uid={uid} gid={gid} rid={rid}")
+
+        # グループ/ルームは案内だけ返して終了（1:1のみ運用）
+        if gid or rid:
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage("このボットは1:1トークのみ対応です。友だちチャットでお試しください。")
+                )
+            finally:
+                return
+
+        raw_text = event.message.text or ""
+        t = raw_text.strip()
+
+        # (A) テスター向けショートカット：id/uid/ユーザーid
+        if t.lower() in ("id", "uid") or t in ("ユーザーid", "ユーザid"):
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(f"あなたの userId は:\n{uid}")
+                )
+            finally:
+                return
+
+        # (B) ホワイトリスト（設定時のみ有効）
+        if ALLOWED_USER_IDS and uid and uid not in ALLOWED_USER_IDS:
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage("このボットは招待制です（権限がありません）。")
+                )
+            finally:
+                print(f"[DENY] uid={uid}")
+                return
+
+        # (C) 通常フロー
+        user_key = _source_key(src)
+        out = handle_text(user_key, raw_text)
 
         # QuickReply を数値送信に統一（長文は20字へ丸め）
         quick = out.get("quick", [])
@@ -505,10 +571,13 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
                     actions.append(MessageAction(label=clip_label(lbl, 20), text=lbl))
 
         quickreply = QuickReply(items=[QuickReplyButton(action=a) for a in actions]) if actions else None
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=out.get("text", ""), quick_reply=quickreply)
-        )
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=out.get("text", ""), quick_reply=quickreply)
+            )
+        except Exception as e:
+            print(f"[reply_error] {e}")
 else:
     @app.post("/callback")
     async def callback_dummy(request: Request):
