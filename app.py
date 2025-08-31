@@ -22,6 +22,7 @@ import pandas as pd
 # === New: 表示とペア補完ユーティリティ ===
 from formatters import to_plain_text  # 件数ヘッダ・空行・並び順・（ペア候補）表示
 from search_core import prepare_with_pairs  # ペア候補を未絞り込み結果から補完
+from postprocess import reorder_and_pair 
 
 # ====== LINE SDK（未設定ならダミーで起動可能） ======
 try:
@@ -198,6 +199,9 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
 
     # ペア候補を補完して並び順を確定
     augmented = prepare_with_pairs(cur_rows, prev_rows)
+
+    # ★ ここで「一次＋二次」を同一グループで1まとまりに並べ替え
+    augmented = reorder_and_pair(augmented)
 
     # 件数ヘッダ/空行/（ペア候補）/凡例などは formatters に任せる
     qdict = _make_query_for_formatters(sess)
