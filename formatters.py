@@ -126,7 +126,7 @@ def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> s
 
     # 見出し → 空行 → 本文
     return (
-        f"{header_results}\n\n" + "\n".join(lines) + more +
+        f"{header_results}\n\n" + "\n\n".join(lines) + more +
         legend + ex + "\n\n" + header_query + summary_tail
     )
 
