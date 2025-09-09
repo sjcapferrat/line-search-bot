@@ -1,28 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-app.py（シンプル版 v2.4）
+app.py（シンプル版 v2.6）
 
-追加点（v2.3 → v2.4）
-- formatters.to_plain_text を採用：見出し「＝＝＝検索結果＝＝＝N件」＋直後に空行＋（ペア候補）表示
-- search_core.prepare_with_pairs で、機械カテゴリ/機種で絞った後でも前段ヒットから対工程を補完
-- 並び順は「単一工程 → ◎ → ○(〇) → △ → 空」を formatters 側で確定
-
-既存の会話フローや QuickReply 制御は従来通り。
+変更点:
+- v2.5 → v2.6
+  1) FutureWarning の解消：_unique_in_order で pd.unique(series) を使用
+  2) 要件②：多数ヒット時に「深さ/厚さ」候補を QuickReply に提示し、選択でレンジ重なり絞り込み
+  3) 既存の要件①（2行目サマリー＋工程ラベル）は formatters.py / app.py の _stage/_hit_stage 付与で対応済み
 """
 from __future__ import annotations
 import os
 import re
 import json
+import math
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 import pandas as pd
 
-# === New: 表示とペア補完ユーティリティ ===
-from formatters import to_plain_text  # 件数ヘッダ・空行・並び順・（ペア候補）表示
+# === 表示とペア補完ユーティリティ ===
+from formatters import to_plain_text  # 件数ヘッダ・空行・並び順・（ペア候補）表示＋工程ラベル
 from search_core import prepare_with_pairs  # ペア候補を未絞り込み結果から補完
-from postprocess import reorder_and_pair 
+from postprocess import reorder_and_pair    # あれば利用（一次/二次の並び整形）
 
 # ====== LINE SDK（未設定ならダミーで起動可能） ======
 try:
@@ -36,6 +36,8 @@ try:
 except Exception:
     LINE_AVAILABLE = False
 
+
+
 # =============================
 # 設定
 # =============================
@@ -46,7 +48,6 @@ ALLOWED_USER_IDS = set(u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "")
 
 MAX_QUICKREPLIES = 12
 RESULTS_REFINE_THRESHOLD = 5
-APP_VERSION = "app.py (simple v2.4)"
 
 # =============================
 # UTF-8 JSON
@@ -56,8 +57,37 @@ class UTF8JSONResponse(JSONResponse):
     def render(self, content: object) -> bytes:
         return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
+APP_VERSION = "app.py (simple v2.6)"
 app = FastAPI(default_response_class=UTF8JSONResponse)
 
+# === Version meta ===
+import pathlib, os as _os
+
+def _read_git_sha() -> str:
+    env_sha = _os.environ.get("RENDER_GIT_COMMIT")
+    if env_sha:
+        return env_sha
+    p = pathlib.Path(__file__).with_name("git_sha.txt")
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return "unknown"
+
+GIT_SHA = _read_git_sha()
+
+import logging
+logger = logging.getLogger("uvicorn.error")  # Renderのログに確実に出る
+
+@app.get("/version")
+def version():
+    return {"app_version": APP_VERSION, "git_sha": GIT_SHA}
+
+@app.on_event("startup")
+async def _boot_log():
+    logger.info(f"[BOOT] {APP_VERSION} commit={GIT_SHA}")
+    
 # =============================
 # データ読み込み
 # =============================
@@ -89,7 +119,8 @@ def load_dataframe(path: str) -> pd.DataFrame:
 DF = load_dataframe(CSV_PATH)
 
 def _unique_in_order(series: pd.Series) -> List[str]:
-    return [x for x in pd.unique(series.tolist()) if str(x) != ""]
+    # FutureWarning 回避: series.tolist() を渡さず series を直接 pd.unique に
+    return [x for x in pd.unique(series) if str(x) != ""]
 
 ALL_UNIQUE = {
     "作業名": _unique_in_order(DF["作業名"]),
@@ -123,6 +154,117 @@ def assemble_quick(options: List[str], controls: List[str] | Tuple[str, ...] = (
 def clip_label(label: str, maxlen: int = 20) -> str:
     return label if len(label) <= maxlen else (label[: maxlen - 1] + "…")
 
+# ---- 工程正規化とフラグ付与 --------------------------------
+def _normalize_stage(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    s = str(raw).strip().upper()
+    if "単一" in s or "SINGLE" in s:
+        return "SINGLE"
+    if s.startswith("A") or "一次" in s or "一次工程" in s:
+        return "A"
+    if s.startswith("B") or "二次" in s or "二次工程" in s:
+        return "B"
+    return None
+
+def _stage_hit_flag(row_stage_norm: Optional[str], stage_filter_val: Optional[str]) -> bool:
+    if not stage_filter_val:
+        return False
+    want = _normalize_stage(stage_filter_val)
+    return (want is not None) and (row_stage_norm == want)
+
+def _annotate_stage_flags(rows: List[Dict], stage_filter_val: Optional[str]) -> List[Dict]:
+    out = []
+    for r in rows or []:
+        rr = dict(r)
+        st = _normalize_stage(rr.get("工程数"))
+        rr["_stage"] = st
+        rr["_hit_stage"] = _stage_hit_flag(st, stage_filter_val)
+        out.append(rr)
+    return out
+# -------------------------------------------------------------
+
+# ---- 深さ/厚さユーティリティ -------------------------------
+_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+def _normalize_depth_str(v: Optional[str]) -> Optional[str]:
+    if not v:
+        return None
+    s = str(v).strip()
+    z2h = str.maketrans("－０１２３４５６７８９．〜～", "-0123456789.~")
+    s = s.translate(z2h).replace(" ", "")
+    s = s.replace("~", "-").replace("–", "-")
+    # 単値なら mm 付与
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        s = s + "mm"
+    # "mm" 統一
+    s = re.sub(r"(?<=\d)\s*mm$", "mm", s, flags=re.I)
+    return s
+
+def _parse_depth_range_cell(cell: str) -> Optional[Tuple[float, float]]:
+    if not cell:
+        return None
+    t = (cell.replace("㎜", "mm")
+              .replace("〜", "~").replace("～", "~")
+              .replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-").replace("−", "-"))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        lo = float(m.group(1)); hi = float(m.group(2))
+        if lo > hi:
+            lo, hi = hi, lo
+        return (lo, hi)
+    m = re.search(r"^\s*~\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        hi = float(m.group(1))
+        return (0.0, hi)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm|ミリ|ﾐﾘ)?\b", t, re.IGNORECASE)
+    if m:
+        v = float(m.group(1)); return (v, v)
+    return None
+
+def _range_overlap(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+    return not (a[1] < b[0] or b[1] < a[0])
+
+def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 8) -> List[str]:
+    vals = set()
+    if "処理する深さ・厚さ" in df.columns:
+        for v in df["処理する深さ・厚さ"].tolist():
+            n = _normalize_depth_str(v)
+            if n:
+                vals.add(n)
+    # 数値下限でソート（レンジは下限→幅）
+    def keyfun(x: str):
+        m = re.match(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?", x)
+        if m:
+            lo = float(m.group(1))
+            hi = float(m.group(2)) if m.group(2) else lo
+            return (lo, hi - lo)
+        return (math.inf, 0.0)
+    return sorted(vals, key=keyfun)[:limit]
+
+def _filter_df_by_depth(df: pd.DataFrame, choice: str) -> pd.DataFrame:
+    """
+    choice: _depth_candidates_from_df で提示した値（例: '0.7mm' / '0.5-1.0mm'）
+    行側の「処理する深さ・厚さ」レンジと重なりがある行のみ残す。
+    """
+    want = _normalize_depth_str(choice) or ""
+    m = re.match(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?", want)
+    if not m:
+        return df
+    lo = float(m.group(1))
+    hi = float(m.group(2)) if m.group(2) else lo
+
+    def ok(cell: str) -> bool:
+        rng = _parse_depth_range_cell(cell or "")
+        return bool(rng and _range_overlap(rng, (lo, hi)))
+
+    if "処理する深さ・厚さ" not in df.columns:
+        return df
+    mask = df["処理する深さ・厚さ"].apply(ok)
+    out = df[mask]
+    return out
+# -------------------------------------------------------------
+
 # =============================
 # セッション管理
 # =============================
@@ -144,10 +286,13 @@ class SearchSession:
             "下地の状況": None,
             "機械カテゴリー": None,
             "ライナックス機種名": None,
+            "工程数": None,  # NEW: 工程数フィルタ保持（A/B/単一）
         }
         self.last_results: Optional[pd.DataFrame] = None
-        # New: ペア補完用に「未絞り込み（=作業名+下地）」の直近ヒットを保持
+        # ペア補完用に「未絞り込み（=作業名+下地）」の直近ヒットを保持
         self.last_unfiltered_hits: List[Dict] = []
+        # 多数時に提示する深さ/厚さ候補
+        self.depth_options: List[str] = []
 
     def reset(self):
         self.__init__()
@@ -171,7 +316,7 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, Optional[str]]) -> pd.Dat
             q = q[q[key] == val]
     return q
 
-# --- New: formatters に渡すための query dict を生成（リスト形式で） ---
+# --- formatters に渡すための query dict を生成（リスト形式で） ---
 def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
     def _as_list(v: Optional[str]) -> List[str]:
         return [v] if v else []
@@ -180,30 +325,35 @@ def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
         "下地の状況": _as_list(sess.filters.get("下地の状況")),
         "機械カテゴリー": _as_list(sess.filters.get("機械カテゴリー")),
         "ライナックス機種名": _as_list(sess.filters.get("ライナックス機種名")),
-        # 深さ系は今回 UI から直接入れていないため省略（将来拡張時に付与）
         "処理する深さ・厚さ": [],
         "作業効率評価": [],
-        "工程数": [],
+        "工程数": _as_list(sess.filters.get("工程数")),
     }
 
-# --- New: 結果のテキストを生成（ペア補完＋並び順＋件数ヘッダは formatters に任せる） ---
+# --- 結果のテキストを生成（ペア補完＋並び順＋件数ヘッダは formatters に任せる） ---
 def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
     # 前段（未絞り込み）は「作業名＋下地」のみ適用
     base_filters = {k: v for k, v in sess.filters.items() if k in ("作業名", "下地の状況")}
     prev_df = apply_filters(DF, base_filters)
     prev_rows = prev_df.to_dict(orient="records")
-    sess.last_unfiltered_hits = prev_rows  # セッションにも保存
+    sess.last_unfiltered_hits = prev_rows
 
     # 現在の表示対象
     cur_rows = filtered_df.to_dict(orient="records")
 
-    # ペア候補を補完して並び順を確定
+    # _stage/_hit_stage を付与してからペア補完
+    cur_rows = _annotate_stage_flags(cur_rows, sess.filters.get("工程数"))
+    prev_rows = _annotate_stage_flags(prev_rows, sess.filters.get("工程数"))
+
+    # ペア候補を補完
     augmented = prepare_with_pairs(cur_rows, prev_rows)
 
-    # ★ ここで「一次＋二次」を同一グループで1まとまりに並べ替え
-    augmented = reorder_and_pair(augmented)
+    # 一次/二次の並べ方を整える（postprocess.reorder_and_pair がある場合）
+    try:
+        augmented = reorder_and_pair(augmented)
+    except Exception:
+        pass
 
-    # 件数ヘッダ/空行/（ペア候補）/凡例などは formatters に任せる
     qdict = _make_query_for_formatters(sess)
     return to_plain_text(augmented, qdict, explain="")
 
@@ -269,7 +419,7 @@ def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) ->
     return "", []
 
 # =============================
-# 検索→表示（必要箇所のみ差し替え）
+# 検索→表示
 # =============================
 def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str]) -> Dict[str, object]:
     results = apply_filters(DF, sess.filters)
@@ -285,13 +435,24 @@ def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str
     if len(results) >= RESULTS_REFINE_THRESHOLD:
         sess.stage = Stage.REFINE_MORE
         col, vals = next_refine_suggestions(results, used_optional)
-        if not col or not vals:
-            # ここは即表示へ（ペア候補付きで）
+
+        # 深さ/厚さ候補を抽出して Quick に混ぜる
+        sess.depth_options = _depth_candidates_from_df(results)
+        quick_opts = (sess.depth_options or []) + (vals or [])
+
+        if not quick_opts:
+            # 何も出せない場合は即表示
             sess.stage = Stage.SHOW_RESULTS
             return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
+
+        msg = f"該当 {len(results)} 件。"
+        if col and vals:
+            msg += f"『{col}』で更に絞り込めます。"
+        if sess.depth_options:
+            msg += "\nまたは『深さ/厚さ』で絞り込めます。"
         return {
-            "text": f"該当 {len(results)} 件。『{col}』で更に絞り込めます。",
-            "quick": assemble_quick(vals, ["やり直す", "終了"]),
+            "text": msg,
+            "quick": assemble_quick(quick_opts, ["やり直す", "終了"]),
         }
 
     # 少件数はすぐ表示（ペア候補付き）
@@ -392,18 +553,37 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
     if sess.stage == Stage.REFINE_MORE:
         col, vals = next_refine_suggestions(sess.last_results, _used_optional(sess))
-        if not col or not vals:
+        combined_opts = (sess.depth_options or []) + (vals or [])
+        if not col and not combined_opts:
             sess.stage = Stage.SHOW_RESULTS
             return {"text": build_results_text(sess, sess.last_results), "quick": ["やり直す", "終了"]}
-        choice = resolve_choice(t, vals)
+
+        choice = resolve_choice(t, combined_opts)
         if not choice:
-            return {"text": f"『{col}』から選んでください。", "quick": assemble_quick(vals, ["やり直す", "終了"])}
-        filtered = sess.last_results[sess.last_results[col] == choice]
+            hint = "候補から選んでください。"
+            if col:
+                hint = f"『{col}』または『深さ/厚さ』の候補から選んでください。"
+            return {"text": hint, "quick": assemble_quick(combined_opts, ["やり直す", "終了"])}
+
+        # 深さ/厚さ候補が選ばれた場合はレンジ重なりで絞り込み
+        if sess.depth_options and choice in sess.depth_options:
+            filtered = _filter_df_by_depth(sess.last_results, choice)
+            msg_col_part = f"深さ/厚さ ≈ {choice}"
+        else:
+            # 通常列での絞り込み
+            filtered = sess.last_results[sess.last_results[col] == choice] if col else sess.last_results
+            if col == "工程数":
+                sess.filters["工程数"] = choice  # _hit_stage の根拠
+            msg_col_part = f"{col} = {choice}" if col else f"{choice}"
+
         sess.last_results = filtered
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
+            # 次のステップでも深さ候補を再計算して提示
+            next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
+            next_depth = _depth_candidates_from_df(filtered)
             return {
-                "text": f"『{col} = {choice}』で絞り込みました。(件数: {len(filtered)})\nさらに絞り込み可能です。",
-                "quick": assemble_quick(next_refine_suggestions(filtered, _used_optional(sess))[1], ["やり直す", "終了"]),
+                "text": f"『{msg_col_part}』で絞り込みました。(件数: {len(filtered)})\nさらに絞り込み可能です。",
+                "quick": assemble_quick((next_depth or []) + (next_vals or []), ["やり直す", "終了"]),
             }
         else:
             sess.stage = Stage.SHOW_RESULTS

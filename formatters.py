@@ -51,11 +51,22 @@ def _humanize_query(query: Dict[str, Any]) -> List[str]:
         out.append(f"評価: {_join(query['作業効率評価'])}")
     return out
 
-# 並び順制御（ここを追加）
+# 並び順制御
 _EFF_RANK = {"◎": 0, "○": 1, "": 3, None: 3, "△": 2}  # ◎→○→△→空（△は2とする）
 def _is_single(r: dict) -> bool:
+    # search_core から _stage='SINGLE' が来る想定／無ければ工程数文字列で判定
+    st = (r.get("_stage") or "").upper()
+    if st == "SINGLE":
+        return True
     s = str(r.get("工程数", "")).strip()
     return s in ("単一", "単一工程")
+
+def _is_pair_stage(r: dict) -> bool:
+    st = (r.get("_stage") or "").upper()
+    if st in ("A", "B"):
+        return True
+    s = str(r.get("工程数", "")).strip()
+    return ("一次" in s) or ("二次" in s)
 
 def _sort_for_view(rows: List[dict]) -> List[dict]:
     def key(r: dict):
@@ -64,6 +75,19 @@ def _sort_for_view(rows: List[dict]) -> List[dict]:
         eff_rank = _EFF_RANK.get(eff, 3)
         return (single_rank, eff_rank)
     return sorted(rows, key=key)
+
+def _stage_hit_suffix(r: dict) -> str:
+    """
+    一次/二次工程の行に、ヒット/非対象ペアのラベルを付与。
+    - _stage='A' or 'B' のときのみ表示
+    - _hit_stage=True → （検索ヒットした工程）
+      それ以外       → （検索対象でないペア工程）
+    単一工程はラベルなし。
+    """
+    st = (r.get("_stage") or "").upper()
+    if st not in ("A", "B"):
+        return ""
+    return "（検索ヒットした工程）" if r.get("_hit_stage") else "（検索対象でないペア工程）"
 
 def _render_line(r: dict) -> str:
     eff   = _eff_norm(r.get("作業効率評価", ""))
@@ -75,11 +99,32 @@ def _render_line(r: dict) -> str:
     steps = r.get("工程数", "")
     steps_sfx = f" / 工程: {steps}" if steps else ""
     prefix = "（ペア候補）" if r.get("_pair_candidate") else ""
-    # 例）◎ K-200ENV + ブロックチップⅡ | 塗膜や堆積物の除去 / 厚膜塗料（エポキシ） / 厚さ 0.5–1.0mm / 工程: 単一
+    stage_mark = _stage_hit_suffix(r)
+
+    # 例）◎ K-200ENV + ブロックチップⅡ | 塗膜や堆積物の除去 / 厚膜塗料（エポキシ） / 厚さ 0.5–1.0mm / 工程: 単一（検索ヒットした工程）
     return (
         f"{prefix}{eff or '・'} {mech} + {cutter} | "
         f"{job} / {sub} / {depth}{steps_sfx}"
+        f"{stage_mark}"
     )
+
+def _summary_line(rows: List[dict]) -> str:
+    """
+    2行目用サマリー文：
+      - 「全て単一工程」
+      - 「単一＋一次／二次が含まれる」
+      - 「すべて一次／二次で単一なし」
+    """
+    if not rows:
+        return "検索結果はありません"
+    has_single = any(_is_single(r) for r in rows)
+    has_pair   = any(_is_pair_stage(r) for r in rows)
+    if has_single and not has_pair:
+        return "検索された工法は全て単一工程です"
+    elif has_single and has_pair:
+        return "検索された工法の中には単一工程のほか、一次／二次工程が含まれます"
+    else:
+        return "検索された工法はすべて一次／二次工程で、単一工程はありません"
 
 # ---- 公開関数 ---------------------------------------------------
 
@@ -88,8 +133,10 @@ def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> s
     人に読みやすいテキスト整形。
     変更点：
       - 先頭の件数見出しを「＝＝＝検索結果＝＝＝{件数}件」に統一
+      - 2行目にサマリー文（単一のみ／混在／一次二次のみ）を挿入 ←★今回追加
       - 見出しのあとに1行の空行
       - 並びは「単一工程を最優先 → ◎→○→△→空」に再ソート（formatters側で安全に実施）
+      - 一次/二次工程の行末に「（検索ヒットした工程）」or「（検索対象でないペア工程）」を付与 ←★今回追加
       - ペア候補（_pair_candidate=True）は先頭に「（ペア候補）」を表示
     既存仕様：
       - 多すぎる場合は先頭30件のみ表示（LINE 文字数対策）
@@ -99,16 +146,20 @@ def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> s
     ordered = _sort_for_view(results or [])
     total = len(ordered)
 
-    # 件数見出し（ユーザー要望の書式）
+    # 件数見出し
     header_results = f"＝＝＝検索結果＝＝＝{total}件"
 
     if total == 0:
-        # 条件サマリは既存のまま残す
         qlines = _humanize_query(query)
         header_query = "🔎 抽出条件\n" + ("\n".join(f"・{ln}" for ln in qlines) if qlines else "・（特になし）")
         legend = "※ 評価の意味: ◎=非常に適, ○=適, △=一部条件で可\n"
         ex = f"（{explain}）" if explain else ""
-        return f"{header_results}\n\n該当するレコードは見つかりませんでした。\n{legend}{ex}\n\n{header_query}".strip()
+        # 2行目サマリーも一応付ける
+        summary2 = _summary_line(ordered)
+        return f"{header_results}\n{summary2}\n\n該当するレコードは見つかりませんでした。\n{legend}{ex}\n\n{header_query}".strip()
+
+    # 2行目サマリー
+    summary2 = _summary_line(ordered)
 
     # 上限30件表示（既存踏襲）
     SHOW_MAX = 30
@@ -124,16 +175,18 @@ def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> s
     legend = "\n\n※ 評価の意味: ◎=非常に適, ○=適, △=一部条件で可"
     ex = f"\n（{explain}）" if explain else ""
 
-    # 見出し → 空行 → 本文
+    # 見出し → 2行目サマリー → 空行 → 本文
     return (
-        f"{header_results}\n\n" + "\n\n".join(lines) + more +
+        f"{header_results}\n{summary2}\n\n" + "\n\n".join(lines) + more +
         legend + ex + "\n\n" + header_query + summary_tail
     )
 
 def to_flex_message(results: List[dict]) -> dict:
     """
     LINEのFlex Message用（上位10件）。
-    （最小変更）ペア候補の印だけタイトルの頭に付与
+    （最小変更）
+      - ペア候補の印をタイトル頭に付与
+      - 一次/二次工程ならサブ行末に「（検索ヒットした工程）」or「（検索対象でないペア工程）」を付与
     """
     bubbles = []
     for r in (results or [])[:10]:
@@ -150,6 +203,10 @@ def to_flex_message(results: List[dict]) -> dict:
         depth_line = f"{depth}"
         if steps:
             depth_line += f" / 工程: {steps}"
+
+        stage_mark = _stage_hit_suffix(r)
+        if stage_mark:
+            depth_line += stage_mark
 
         bubbles.append({
             "type": "bubble",
