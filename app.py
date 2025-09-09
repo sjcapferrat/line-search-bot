@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-app.py（シンプル版 v2.6）
+app.py（シンプル版 v2.7）
 
 変更点:
-- v2.5 → v2.6
-  1) FutureWarning の解消：_unique_in_order で pd.unique(series) を使用
-  2) 要件②：多数ヒット時に「深さ/厚さ」候補を QuickReply に提示し、選択でレンジ重なり絞り込み
-  3) 既存の要件①（2行目サマリー＋工程ラベル）は formatters.py / app.py の _stage/_hit_stage 付与で対応済み
+- v2.6 → v2.7
+  1) 多数ヒット時に『処理する深さ・厚さ』の Quick を“最優先”提示（候補がある場合）
+  2) 厚さ選択後も多数なら再度 厚さQuick＋通常列のQuick を提示（多段リファイン）
+  3) formatters 側の工程ラベルを活かすために _stage/_hit_stage を付与
+  4) /version エンドポイントと [BOOT] ログ継続
 """
 from __future__ import annotations
 import os
@@ -20,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 import pandas as pd
 
 # === 表示とペア補完ユーティリティ ===
-from formatters import to_plain_text  # 件数ヘッダ・空行・並び順・（ペア候補）表示＋工程ラベル
+from formatters import to_plain_text  # 件数ヘッダ・2行目サマリー・（ペア候補）表示・工程ラベル
 from search_core import prepare_with_pairs  # ペア候補を未絞り込み結果から補完
 from postprocess import reorder_and_pair    # あれば利用（一次/二次の並び整形）
 
@@ -36,8 +37,6 @@ try:
 except Exception:
     LINE_AVAILABLE = False
 
-
-
 # =============================
 # 設定
 # =============================
@@ -47,7 +46,7 @@ CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 ALLOWED_USER_IDS = set(u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",") if u.strip())
 
 MAX_QUICKREPLIES = 12
-RESULTS_REFINE_THRESHOLD = 5
+RESULTS_REFINE_THRESHOLD = 5  # これ以上は“多数”としてリファインを提示
 
 # =============================
 # UTF-8 JSON
@@ -57,11 +56,12 @@ class UTF8JSONResponse(JSONResponse):
     def render(self, content: object) -> bytes:
         return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
-APP_VERSION = "app.py (simple v2.6)"
+APP_VERSION = "app.py (simple v2.7)"
 app = FastAPI(default_response_class=UTF8JSONResponse)
 
 # === Version meta ===
-import pathlib, os as _os
+import pathlib, os as _os, logging
+logger = logging.getLogger("uvicorn.error")  # Renderのログに確実に出る
 
 def _read_git_sha() -> str:
     env_sha = _os.environ.get("RENDER_GIT_COMMIT")
@@ -77,9 +77,6 @@ def _read_git_sha() -> str:
 
 GIT_SHA = _read_git_sha()
 
-import logging
-logger = logging.getLogger("uvicorn.error")  # Renderのログに確実に出る
-
 @app.get("/version")
 def version():
     return {"app_version": APP_VERSION, "git_sha": GIT_SHA}
@@ -87,7 +84,7 @@ def version():
 @app.on_event("startup")
 async def _boot_log():
     logger.info(f"[BOOT] {APP_VERSION} commit={GIT_SHA}")
-    
+
 # =============================
 # データ読み込み
 # =============================
@@ -119,7 +116,7 @@ def load_dataframe(path: str) -> pd.DataFrame:
 DF = load_dataframe(CSV_PATH)
 
 def _unique_in_order(series: pd.Series) -> List[str]:
-    # FutureWarning 回避: series.tolist() を渡さず series を直接 pd.unique に
+    # FutureWarning 回避: series を直接 pd.unique に渡す
     return [x for x in pd.unique(series) if str(x) != ""]
 
 ALL_UNIQUE = {
@@ -286,7 +283,7 @@ class SearchSession:
             "下地の状況": None,
             "機械カテゴリー": None,
             "ライナックス機種名": None,
-            "工程数": None,  # NEW: 工程数フィルタ保持（A/B/単一）
+            "工程数": None,  # 工程数フィルタ保持（A/B/単一）
         }
         self.last_results: Optional[pd.DataFrame] = None
         # ペア補完用に「未絞り込み（=作業名+下地）」の直近ヒットを保持
@@ -434,26 +431,31 @@ def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str
 
     if len(results) >= RESULTS_REFINE_THRESHOLD:
         sess.stage = Stage.REFINE_MORE
+
+        # まず『深さ/厚さ』候補を最優先で作成
+        depth_opts = _depth_candidates_from_df(results)
+
+        # つぎに従来の列候補
         col, vals = next_refine_suggestions(results, used_optional)
 
-        # 深さ/厚さ候補を抽出して Quick に混ぜる
-        sess.depth_options = _depth_candidates_from_df(results)
-        quick_opts = (sess.depth_options or []) + (vals or [])
+        if depth_opts:
+            # 厚さが出せる場合は、厚さ Quick を先頭に提示
+            quick = assemble_quick(depth_opts + (vals or []), ["やり直す", "終了"])
+            msg = f"該当 {len(results)} 件。『処理する深さ・厚さ』で更に絞り込めます。"
+            if col and vals:
+                msg += f"\nまたは『{col}』でも絞り込めます。"
+            return {"text": msg, "quick": quick}
 
-        if not quick_opts:
-            # 何も出せない場合は即表示
-            sess.stage = Stage.SHOW_RESULTS
-            return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
-
-        msg = f"該当 {len(results)} 件。"
+        # 厚さが出せない場合は従来列で提案
         if col and vals:
-            msg += f"『{col}』で更に絞り込めます。"
-        if sess.depth_options:
-            msg += "\nまたは『深さ/厚さ』で絞り込めます。"
-        return {
-            "text": msg,
-            "quick": assemble_quick(quick_opts, ["やり直す", "終了"]),
-        }
+            return {
+                "text": f"該当 {len(results)} 件。『{col}』で更に絞り込めます。",
+                "quick": assemble_quick(vals, ["やり直す", "終了"]),
+            }
+
+        # 何も出せない場合は即表示
+        sess.stage = Stage.SHOW_RESULTS
+        return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
 
     # 少件数はすぐ表示（ペア候補付き）
     sess.stage = Stage.SHOW_RESULTS
@@ -552,23 +554,27 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         return _do_search_and_maybe_refine(sess, used_optional="ライナックス機種名")
 
     if sess.stage == Stage.REFINE_MORE:
+        # ここで、厚さ選択が来たかを最初に判定
+        # 現在の候補セットを再構築（厚さ優先）
+        depth_opts = _depth_candidates_from_df(sess.last_results or DF)
         col, vals = next_refine_suggestions(sess.last_results, _used_optional(sess))
-        combined_opts = (sess.depth_options or []) + (vals or [])
-        if not col and not combined_opts:
-            sess.stage = Stage.SHOW_RESULTS
-            return {"text": build_results_text(sess, sess.last_results), "quick": ["やり直す", "終了"]}
+        combined_opts = (depth_opts or []) + (vals or [])
 
         choice = resolve_choice(t, combined_opts)
         if not choice:
             hint = "候補から選んでください。"
-            if col:
-                hint = f"『{col}』または『深さ/厚さ』の候補から選んでください。"
+            if depth_opts and col:
+                hint = f"『処理する深さ・厚さ』または『{col}』から選んでください。"
+            elif depth_opts:
+                hint = "『処理する深さ・厚さ』から選んでください。"
+            elif col:
+                hint = f"『{col}』から選んでください。"
             return {"text": hint, "quick": assemble_quick(combined_opts, ["やり直す", "終了"])}
 
-        # 深さ/厚さ候補が選ばれた場合はレンジ重なりで絞り込み
-        if sess.depth_options and choice in sess.depth_options:
+        # 深さ/厚さ候補なら、レンジ重なりで絞り込み
+        if depth_opts and choice in depth_opts:
             filtered = _filter_df_by_depth(sess.last_results, choice)
-            msg_col_part = f"深さ/厚さ ≈ {choice}"
+            msg_col_part = f"処理する深さ・厚さ ≈ {choice}"
         else:
             # 通常列での絞り込み
             filtered = sess.last_results[sess.last_results[col] == choice] if col else sess.last_results
@@ -578,9 +584,9 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
         sess.last_results = filtered
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
-            # 次のステップでも深さ候補を再計算して提示
-            next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
+            # 次ステップでも厚さQuickを再提示
             next_depth = _depth_candidates_from_df(filtered)
+            next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
             return {
                 "text": f"『{msg_col_part}』で絞り込みました。(件数: {len(filtered)})\nさらに絞り込み可能です。",
                 "quick": assemble_quick((next_depth or []) + (next_vals or []), ["やり直す", "終了"]),

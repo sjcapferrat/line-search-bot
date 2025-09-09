@@ -6,64 +6,85 @@ Render の **Environment** に以下を設定してください。
 - `LINE_CHANNEL_SECRET`
 - `LINE_CHANNEL_ACCESS_TOKEN`
 - `OPENAI_API_KEY`（任意。未設定ならルールベースのみで抽出します）
+- `RAG_CSV_PATH`（任意。CSVパスを変更したい場合）
+- `SEARCH_SCRIPT_PATH`（任意。独自スクリプトを接続したい場合）
 
 ## 2. デプロイ手順（Render）
 1. 本リポジトリを GitHub にプッシュ
 2. Render > New > Web Service で本リポジトリを選択
-3. Build Command: `pip install -r requirements.txt`
-4. Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-5. デプロイ後、`https://xxxx.onrender.com/callback` を LINE Developers の Webhook に設定 & 有効化
-6. `GET /healthz` でヘルスチェック可
+3. Build Command:  
+   ```bash
+   pip install -r requirements.txt && git rev-parse HEAD > git_sha.txt
+Start Command:
 
-## 3. 既存クエリシステムとの接続
-`search_core.py` をあなたの実装に置き換えてください。
+bash
+Copy code
+uvicorn app:app --host 0.0.0.0 --port $PORT
+デプロイ後、https://xxxx.onrender.com/callback を LINE Developers の Webhook に設定 & 有効化
 
-- **A) 直接関数呼び出し**（推奨）: pandas の DataFrame を `to_dict('records')` で返すだけ
-- **B) HTTP API 呼び出し**: 既存APIがある場合はそのままPOST/GET
-- **C) サブプロセス**: 既存CLIを呼び出して JSON を受け取る
+ヘルスチェック: GET /health
 
-> 重要: **検索結果の内容は絶対に改変しない**（順序やフィルタも変更しない）。
+3. バージョン確認（運用メモ）
+GET /version で現在のアプリバージョンと git commit SHA を確認可能です。
 
-## 4. テスト方法（ローカル）
-```
+json
+Copy code
+{"app_version": "app.py (simple v2.6)", "git_sha": "abcdef123456..."}
+4. 既存クエリシステムとの接続
+search_core.py をあなたの実装に置き換えてください。
+
+A) 直接関数呼び出し（推奨）: pandas の DataFrame を to_dict('records') で返すだけ
+
+B) HTTP API 呼び出し: 既存APIがある場合はそのままPOST/GET
+
+C) サブプロセス: 既存CLIを呼び出して JSON を受け取る
+
+重要: 検索結果の内容は改変しない（順序やフィルタも変更しない）。
+
+5. テスト方法（ローカル）
+bash
+Copy code
 pip install -r requirements.txt
-uvicorn app:app --reload
-```
-- 別ターミナルで `curl localhost:8000/healthz`
-- LINE連携テストは `ngrok http 8000` で一時公開して Webhook に設定
+uvicorn app:app --reload --port 8000
+別ターミナルで:
 
-## 5. UIについて
-- `formatters.py` は見せ方だけを調整（結果データはそのまま）
-- Quick Reply・Flex Message の追加は安全
+bash
+Copy code
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/version
+LINE連携テストは ngrok http 8000 で一時公開して Webhook に設定
 
-## 6. NLP 抽出
-- `nlp_extract.py` は GPT Function Calling + ルールベースのハイブリッド
-- OPENAI_API_KEY 未設定でも動作（ルールのみ）
+6. UIについて
+formatters.py は見せ方だけを調整（結果データはそのまま）
 
-## 7. あなたの既存スクリプトの接続方法（重要）
-- `search_adapter.py` が importlib で **ver4.2_python_based_RAG_wo_GPT.py** を動的ロードします。
-- ファイル名にドットがあり通常importできないため、**環境変数 `SEARCH_SCRIPT_PATH`** にフルパスを設定してください。
-  - 例: `C:\\Users\\takeda\\Documents\\projectRAG\\ver4.2_python_based_RAG_wo_GPT.py`
-- もしくは、ファイル名を `ver4_2_python_based_RAG_wo_GPT.py` にリネームして本プロジェクト直下に置けば、環境変数なしでも読み込みます。
+Quick Reply・Flex Message の追加は安全
 
-### 任意のCSVパスを使いたい場合
-- 環境変数 `RAG_CSV_PATH` を設定すると、ユーザースクリプト内の `CSV_PATH` を上書きします。
+7. NLP 抽出
+nlp_extract.py は GPT Function Calling + ルールベースのハイブリッド
 
-## 8. 環境変数（追加推奨）
-- `SEARCH_SCRIPT_PATH` = `./ver4_2_python_based_RAG_wo_GPT.py`
-- `RAG_CSV_PATH` = `./restructured_file.csv`
-- `PYTHON_VERSION` = `3.12.3`
+OPENAI_API_KEY 未設定でも動作（ルールのみ）
 
-> ※ いずれも **リポジトリ直下**にファイルを置いた前提の相対パスです。  
-> ローカルの `C:\...` パスは Render では使えません。
+8. 任意のCSV/スクリプト指定
+RAG_CSV_PATH = ./restructured_file.csv
 
-## 9. 起動確認とトラブルシュート
-- ヘルスチェック: `GET https://<your-app>.onrender.com/healthz` → `{"status":"ok"}`
-- Verify 失敗/502 のとき:
-  - `Logs` に `FileNotFoundError` → CSV/pyの置き忘れ or パス違い
-  - `OpenAIError: api_key` → `OPENAI_API_KEY` 未設定（または **遅延インポート版 app.py** 未適用）
-  - `Invalid signature`（手動POST時）→ 正常。Webhookエンドポイントは生きています
+SEARCH_SCRIPT_PATH = ./ver4_2_python_based_RAG_wo_GPT.py
 
-## 10. 実装メモ
-- `app.py` は **遅延インポート** 版（/callback 内で `nlp_extract` と `search_core` を import）
-- `search_adapter.py` は **遅延ロード** 版（最初の検索時に CSV を読み込む）
+9. 起動確認とトラブルシュート
+ヘルスチェック:
+GET https://<your-app>.onrender.com/health
+
+バージョン確認:
+GET https://<your-app>.onrender.com/version
+
+Verify 失敗/502 のとき:
+
+FileNotFoundError → CSV/py の置き忘れ or パス違い
+
+OpenAIError: api_key → OPENAI_API_KEY 未設定
+
+Invalid signature（手動POST時）→ 正常。Webhookエンドポイントは生きています
+
+10. 実装メモ
+app.py は 遅延インポート 版
+
+search_adapter.py は 遅延ロード 版（最初の検索時に CSV を読み込む）
