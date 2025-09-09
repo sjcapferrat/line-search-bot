@@ -36,6 +36,8 @@ try:
 except Exception:
     LINE_AVAILABLE = False
 
+
+
 # =============================
 # 設定
 # =============================
@@ -46,7 +48,6 @@ ALLOWED_USER_IDS = set(u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "")
 
 MAX_QUICKREPLIES = 12
 RESULTS_REFINE_THRESHOLD = 5
-APP_VERSION = "app.py (simple v2.6)"
 
 # =============================
 # UTF-8 JSON
@@ -56,8 +57,37 @@ class UTF8JSONResponse(JSONResponse):
     def render(self, content: object) -> bytes:
         return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
+APP_VERSION = "app.py (simple v2.6)"
 app = FastAPI(default_response_class=UTF8JSONResponse)
 
+# === Version meta ===
+import pathlib, os as _os
+
+def _read_git_sha() -> str:
+    env_sha = _os.environ.get("RENDER_GIT_COMMIT")
+    if env_sha:
+        return env_sha
+    p = pathlib.Path(__file__).with_name("git_sha.txt")
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return "unknown"
+
+GIT_SHA = _read_git_sha()
+
+import logging
+logger = logging.getLogger("uvicorn.error")  # Renderのログに確実に出る
+
+@app.get("/version")
+def version():
+    return {"app_version": APP_VERSION, "git_sha": GIT_SHA}
+
+@app.on_event("startup")
+async def _boot_log():
+    logger.info(f"[BOOT] {APP_VERSION} commit={GIT_SHA}")
+    
 # =============================
 # データ読み込み
 # =============================
