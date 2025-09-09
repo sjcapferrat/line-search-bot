@@ -53,6 +53,7 @@ def _humanize_query(query: Dict[str, Any]) -> List[str]:
 
 # 並び順制御
 _EFF_RANK = {"◎": 0, "○": 1, "": 3, None: 3, "△": 2}  # ◎→○→△→空（△は2とする）
+
 def _is_single(r: dict) -> bool:
     # search_core から _stage='SINGLE' が来る想定／無ければ工程数文字列で判定
     st = (r.get("_stage") or "").upper()
@@ -79,15 +80,24 @@ def _sort_for_view(rows: List[dict]) -> List[dict]:
 def _stage_hit_suffix(r: dict) -> str:
     """
     一次/二次工程の行に、ヒット/非対象ペアのラベルを付与。
-    - _stage='A' or 'B' のときのみ表示
-    - _hit_stage=True → （検索ヒットした工程）
-      それ以外       → （検索対象でないペア工程）
-    単一工程はラベルなし。
+    優先: _stage/_hit_stage があればそれを使う。無ければ工程数と _pair_candidate から判定。
+    - 単一工程はラベルなし。
     """
-    st = (r.get("_stage") or "").upper()
-    if st not in ("A", "B"):
+    # 単一なら何も付けない
+    if _is_single(r):
         return ""
-    return "（検索ヒットした工程）" if r.get("_hit_stage") else "（検索対象でないペア工程）"
+
+    # 1) _stage / _hit_stage が来ている場合はそれを採用
+    st = (r.get("_stage") or "").upper()
+    if st in ("A", "B"):
+        return "（検索ヒットした工程）" if r.get("_hit_stage") else "（検索対象でないペア工程）"
+
+    # 2) フォールバック：工程数と _pair_candidate で判定
+    steps = str(r.get("工程数", "")).strip()
+    is_pair_stage = ("一次" in steps) or ("二次" in steps)
+    if not is_pair_stage:
+        return ""
+    return "（検索対象でないペア工程）" if r.get("_pair_candidate") else "（検索ヒットした工程）"
 
 def _render_line(r: dict) -> str:
     eff   = _eff_norm(r.get("作業効率評価", ""))
@@ -100,12 +110,13 @@ def _render_line(r: dict) -> str:
     steps_sfx = f" / 工程: {steps}" if steps else ""
     prefix = "（ペア候補）" if r.get("_pair_candidate") else ""
     stage_mark = _stage_hit_suffix(r)
+    stage_sfx = f" {stage_mark}" if stage_mark else ""
 
-    # 例）◎ K-200ENV + ブロックチップⅡ | 塗膜や堆積物の除去 / 厚膜塗料（エポキシ） / 厚さ 0.5–1.0mm / 工程: 単一（検索ヒットした工程）
+    # 例）◎ K-200ENV + ブロックチップⅡ | 作業 / 下地 / 0.5–1.0mm / 工程: 一次工程 （検索ヒットした工程）
     return (
         f"{prefix}{eff or '・'} {mech} + {cutter} | "
         f"{job} / {sub} / {depth}{steps_sfx}"
-        f"{stage_mark}"
+        f"{stage_sfx}"
     )
 
 def _summary_line(rows: List[dict]) -> str:
@@ -131,43 +142,30 @@ def _summary_line(rows: List[dict]) -> str:
 def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> str:
     """
     人に読みやすいテキスト整形。
-    変更点：
-      - 先頭の件数見出しを「＝＝＝検索結果＝＝＝{件数}件」に統一
-      - 2行目にサマリー文（単一のみ／混在／一次二次のみ）を挿入 ←★今回追加
-      - 見出しのあとに1行の空行
-      - 並びは「単一工程を最優先 → ◎→○→△→空」に再ソート（formatters側で安全に実施）
-      - 一次/二次工程の行末に「（検索ヒットした工程）」or「（検索対象でないペア工程）」を付与 ←★今回追加
-      - ペア候補（_pair_candidate=True）は先頭に「（ペア候補）」を表示
-    既存仕様：
-      - 多すぎる場合は先頭30件のみ表示（LINE 文字数対策）
-      - 抽出条件の要約や評価内訳は維持（末尾に）
+      - 先頭: 「＝＝＝検索結果＝＝＝{件数}件」
+      - 2行目: サマリー（単一/一次/二次）
+      - 空行
+      - 本文（並びは 単一→◎→○→△→空、ペア補完は _pair_candidate 利用）
+      - 末尾に凡例・抽出条件サマリ・評価内訳
     """
-    # 並び順をここで安全に確定
     ordered = _sort_for_view(results or [])
     total = len(ordered)
 
-    # 件数見出し
     header_results = f"＝＝＝検索結果＝＝＝{total}件"
+    summary_line = _summary_line(ordered) if total > 0 else "該当するレコードは見つかりませんでした。"
 
     if total == 0:
         qlines = _humanize_query(query)
         header_query = "🔎 抽出条件\n" + ("\n".join(f"・{ln}" for ln in qlines) if qlines else "・（特になし）")
         legend = "※ 評価の意味: ◎=非常に適, ○=適, △=一部条件で可\n"
         ex = f"（{explain}）" if explain else ""
-        # 2行目サマリーも一応付ける
-        summary2 = _summary_line(ordered)
-        return f"{header_results}\n{summary2}\n\n該当するレコードは見つかりませんでした。\n{legend}{ex}\n\n{header_query}".strip()
+        return f"{header_results}\n{summary_line}\n\n{legend}{ex}\n\n{header_query}".strip()
 
-    # 2行目サマリー
-    summary2 = _summary_line(ordered)
-
-    # 上限30件表示（既存踏襲）
     SHOW_MAX = 30
     shown = ordered[:SHOW_MAX]
     lines = [_render_line(r) for r in shown]
     more = f"\n…ほか {total - SHOW_MAX} 件" if total > SHOW_MAX else ""
 
-    # 参考情報（従来の要約と内訳も最後に残す）
     qlines = _humanize_query(query)
     header_query = "🔎 抽出条件\n" + ("\n".join(f"・{ln}" for ln in qlines) if qlines else "・（特になし）")
     g, s, w = _count_by_eff(ordered)
@@ -175,28 +173,26 @@ def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> s
     legend = "\n\n※ 評価の意味: ◎=非常に適, ○=適, △=一部条件で可"
     ex = f"\n（{explain}）" if explain else ""
 
-    # 見出し → 2行目サマリー → 空行 → 本文
     return (
-        f"{header_results}\n{summary2}\n\n" + "\n\n".join(lines) + more +
+        f"{header_results}\n{summary_line}\n\n" + "\n\n".join(lines) + more +
         legend + ex + "\n\n" + header_query + summary_tail
     )
 
 def to_flex_message(results: List[dict]) -> dict:
     """
     LINEのFlex Message用（上位10件）。
-    （最小変更）
       - ペア候補の印をタイトル頭に付与
-      - 一次/二次工程ならサブ行末に「（検索ヒットした工程）」or「（検索対象でないペア工程）」を付与
+      - 一次/二次工程なら本文の末尾にラベル付与
     """
     bubbles = []
     for r in (results or [])[:10]:
-        eff   = _eff_norm(r.get("作業効率評価",""))
-        mech  = r.get("ライナックス機種名","") or "-"
-        cutter= r.get("使用カッター名","") or "-"
-        job   = r.get("作業名","") or "-"
-        sub   = r.get("下地の状況","") or "-"
-        depth = r.get("処理する深さ・厚さ","") or "-"
-        steps = r.get("工程数","")
+        eff    = _eff_norm(r.get("作業効率評価",""))
+        mech   = r.get("ライナックス機種名","") or "-"
+        cutter = r.get("使用カッター名","") or "-"
+        job    = r.get("作業名","") or "-"
+        sub    = r.get("下地の状況","") or "-"
+        depth  = r.get("処理する深さ・厚さ","") or "-"
+        steps  = r.get("工程数","")
         prefix = "（ペア候補）" if r.get("_pair_candidate") else ""
 
         subtitle = f"{job} / {sub}"
@@ -206,7 +202,7 @@ def to_flex_message(results: List[dict]) -> dict:
 
         stage_mark = _stage_hit_suffix(r)
         if stage_mark:
-            depth_line += stage_mark
+            depth_line += f" {stage_mark}"
 
         bubbles.append({
             "type": "bubble",
