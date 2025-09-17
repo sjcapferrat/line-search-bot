@@ -4,7 +4,7 @@ app.py（シンプル版 v2.8）
 
 変更点:
 - v2.6 → v2.8
-  1) 深さ正規化の maketrans を辞書版に変更（長さ不一致エラー修正）
+  1) 深さ正規化の  を辞書版に変更（長さ不一致エラー修正）
   2) DataFrame の真偽判定エラー回避（`df or DF` をやめ、None 明示判定に統一）
   3) 深さ候補抽出を堅牢化（非文字/NaN混入でもOK）
   4) /version で BOOT ログのコミット表示はそのまま
@@ -173,13 +173,11 @@ def _stage_hit_flag(row_stage_norm: Optional[str], stage_filter_val: Optional[st
     want = _normalize_stage(stage_filter_val)
     return (want is not None) and (row_stage_norm == want)
 
-def _annotate_stage_flags(rows: List[Dict], stage_filter_val: Optional[str]) -> List[Dict]:
+def _annotate_stage_flags(rows: List[Dict]) -> List[Dict]:
     out = []
     for r in rows or []:
         rr = dict(r)
-        st = _normalize_stage(rr.get("工程数"))
-        rr["_stage"] = st
-        rr["_hit_stage"] = _stage_hit_flag(st, stage_filter_val)
+        rr["_stage"] = _normalize_stage(rr.get("工程数"))
         out.append(rr)
     return out
 # -------------------------------------------------------------
@@ -358,11 +356,16 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
     cur_rows = filtered_df.to_dict(orient="records")
 
     # _stage/_hit_stage を付与してからペア補完
-    cur_rows = _annotate_stage_flags(cur_rows, sess.filters.get("工程数"))
-    prev_rows = _annotate_stage_flags(prev_rows, sess.filters.get("工程数"))
+    cur_rows = _annotate_stage_flags(cur_rows)
+    prev_rows = _annotate_stage_flags(prev_rows)
 
     # ペア候補を補完
     augmented = prepare_with_pairs(cur_rows, prev_rows)
+
+    # ★ ここを追加：ペアで補完された行(_pair_candidate=True)は「検索対象でないペア工程」
+    #    ＝ ヒットではない。逆に、ペアでない行はヒット扱い。
+    for r in augmented:
+        r["_hit_stage"] = not bool(r.get("_pair_candidate"))
 
     # 一次/二次の並べ方を整える（postprocess.reorder_and_pair がある場合）
     try:
@@ -570,10 +573,15 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
     if sess.stage == Stage.REFINE_MORE:
         col, vals = next_refine_suggestions(sess.last_results, _used_optional(sess))
-        base_df = sess.last_results if (sess.last_results is not None) else DF
+
+        # 直前の結果を必ず基準にする（None対策）
+        base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else DF
+
+        # 表示候補（深さ/厚さ + 軸候補）
         depth_now = _depth_candidates_from_df(base_df)
         combined_opts = (depth_now or []) + (vals or [])
-        if not col and not combined_opts:
+
+        if not combined_opts:
             sess.stage = Stage.SHOW_RESULTS
             return {"text": build_results_text(sess, base_df), "quick": ["やり直す", "終了"]}
 
@@ -584,20 +592,26 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
                 hint = f"『{col}』または『深さ/厚さ』の候補から選んでください。"
             return {"text": hint, "quick": assemble_quick(combined_opts, ["やり直す", "終了"])}
 
-        # 深さ/厚さ候補が選ばれた場合はレンジ重なりで絞り込み
+        # === 実際の絞り込み ===
+        filtered = base_df
+        msg_col_part = ""
+
         if depth_now and (choice in depth_now):
             filtered = _filter_df_by_depth(base_df, choice)
             msg_col_part = f"深さ/厚さ ≈ {choice}"
         else:
-            # 通常列での絞り込み
-            filtered = base_df[base_df[col] == choice] if col else base_df
-            if col == "工程数":
-                sess.filters["工程数"] = choice  # _hit_stage の根拠
-            msg_col_part = f"{col} = {choice}" if col else f"{choice}"
+            if col:
+                filtered = base_df[base_df[col] == choice]
+                msg_col_part = f"{col} = {choice}"
+                if col == "工程数":
+                    sess.filters["工程数"] = choice
+            else:
+                msg_col_part = f"{choice}"
 
+        # ここが超重要：必ず更新して次ステップの候補計算の基準にする
         sess.last_results = filtered
+
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
-            # 次のステップでも深さ候補を再計算して提示
             next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
             next_depth = _depth_candidates_from_df(filtered)
             return {
