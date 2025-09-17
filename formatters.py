@@ -52,10 +52,10 @@ def _humanize_query(query: Dict[str, Any]) -> List[str]:
     return out
 
 # 並び順制御
-_EFF_RANK = {"◎": 0, "○": 1, "": 3, None: 3, "△": 2}  # ◎→○→△→空（△は2とする）
+_EFF_RANK = {"◎": 0, "○": 1, "△": 2, "": 3, None: 3}  # ◎→○→△→空
 
 def _is_single(r: dict) -> bool:
-    # search_core から _stage='SINGLE' が来る想定／無ければ工程数文字列で判定
+    # search_core/app から _stage='SINGLE' が来る想定／無ければ工程数文字列で判定
     st = (r.get("_stage") or "").upper()
     if st == "SINGLE":
         return True
@@ -77,46 +77,61 @@ def _sort_for_view(rows: List[dict]) -> List[dict]:
         return (single_rank, eff_rank)
     return sorted(rows, key=key)
 
-def _stage_hit_suffix(r: dict) -> str:
+# ---- ラベル決定（最重要の修正） -------------------------------
+
+def _stage_hit_label(r: dict) -> str:
     """
-    一次/二次工程の行に、ヒット/非対象ペアのラベルを付与。
-    優先: _stage/_hit_stage があればそれを使う。無ければ工程数と _pair_candidate から判定。
-    - 単一工程はラベルなし。
+    行の末尾に付ける工程ラベルを決定。
+    優先順:
+      1) _hit_label があればそのまま使用（"検索ヒットした工程" / "検索結果とペアになる工程"）
+      2) _is_hit があれば True→ヒット / False→ペア
+      3) _stage + _hit_stage があればそれに従う
+      4) 最後に _pair_candidate の有無で判定
+      5) 単一工程は空文字（ラベル無し）
     """
-    # 単一なら何も付けない
     if _is_single(r):
         return ""
 
-    # 1) _stage / _hit_stage が来ている場合はそれを採用
+    # 1) 明示ラベル
+    lbl = r.get("_hit_label")
+    if isinstance(lbl, str) and lbl.strip():
+        return f"（{lbl.strip()}）"
+
+    # 2) 明示フラグ
+    if "_is_hit" in r:
+        return "（検索ヒットした工程）" if r.get("_is_hit") else "（検索結果とペアになる工程）"
+
+    # 3) _stage/_hit_stage
     st = (r.get("_stage") or "").upper()
     if st in ("A", "B"):
-        return "（検索ヒットした工程）" if r.get("_hit_stage") else "（検索対象でないペア工程）"
+        return "（検索ヒットした工程）" if r.get("_hit_stage") else "（検索結果とペアになる工程）"
 
-    # 2) フォールバック：工程数と _pair_candidate で判定
+    # 4) フォールバック: 工程表記 + _pair_candidate
     steps = str(r.get("工程数", "")).strip()
     is_pair_stage = ("一次" in steps) or ("二次" in steps)
     if not is_pair_stage:
         return ""
-    return "（検索対象でないペア工程）" if r.get("_pair_candidate") else "（検索ヒットした工程）"
+    return "（検索結果とペアになる工程）" if r.get("_pair_candidate") else "（検索ヒットした工程）"
+
+# ---- 行レンダリング --------------------------------------------
 
 def _render_line(r: dict) -> str:
-    eff   = _eff_norm(r.get("作業効率評価", ""))
-    mech  = r.get("ライナックス機種名", "") or "-"
-    cutter= r.get("使用カッター名", "") or "-"
-    job   = r.get("作業名", "") or "-"
-    sub   = r.get("下地の状況", "") or "-"
-    depth = r.get("処理する深さ・厚さ", "") or "-"
-    steps = r.get("工程数", "")
+    eff    = _eff_norm(r.get("作業効率評価", ""))
+    mech   = r.get("ライナックス機種名", "") or "-"
+    cutter = r.get("使用カッター名", "") or "-"
+    job    = r.get("作業名", "") or "-"
+    sub    = r.get("下地の状況", "") or "-"
+    depth  = r.get("処理する深さ・厚さ", "") or "-"
+    steps  = r.get("工程数", "")
+
     steps_sfx = f" / 工程: {steps}" if steps else ""
-    prefix = "（ペア候補）" if r.get("_pair_candidate") else ""
-    stage_mark = _stage_hit_suffix(r)
-    stage_sfx = f" {stage_mark}" if stage_mark else ""
+    stage_sfx = _stage_hit_label(r)
 
     # 例）◎ K-200ENV + ブロックチップⅡ | 作業 / 下地 / 0.5–1.0mm / 工程: 一次工程 （検索ヒットした工程）
     return (
-        f"{prefix}{eff or '・'} {mech} + {cutter} | "
+        f"{eff or '・'} {mech} + {cutter} | "
         f"{job} / {sub} / {depth}{steps_sfx}"
-        f"{stage_sfx}"
+        f"{(' ' + stage_sfx) if stage_sfx else ''}"
     )
 
 def _summary_line(rows: List[dict]) -> str:
@@ -145,7 +160,7 @@ def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> s
       - 先頭: 「＝＝＝検索結果＝＝＝{件数}件」
       - 2行目: サマリー（単一/一次/二次）
       - 空行
-      - 本文（並びは 単一→◎→○→△→空、ペア補完は _pair_candidate 利用）
+      - 本文（並びは 単一→◎→○→△→空、ペア補完は _pair_candidate ではなく工程ラベルで表示）
       - 末尾に凡例・抽出条件サマリ・評価内訳
     """
     ordered = _sort_for_view(results or [])
@@ -181,8 +196,8 @@ def to_plain_text(results: List[dict], query: Dict[str, Any], explain: str) -> s
 def to_flex_message(results: List[dict]) -> dict:
     """
     LINEのFlex Message用（上位10件）。
-      - ペア候補の印をタイトル頭に付与
-      - 一次/二次工程なら本文の末尾にラベル付与
+      - タイトル頭の「（ペア候補）」プレフィックスを廃止
+      - 一次/二次工程なら本文の末尾にラベル（検索ヒット/ペア）を付与
     """
     bubbles = []
     for r in (results or [])[:10]:
@@ -193,14 +208,13 @@ def to_flex_message(results: List[dict]) -> dict:
         sub    = r.get("下地の状況","") or "-"
         depth  = r.get("処理する深さ・厚さ","") or "-"
         steps  = r.get("工程数","")
-        prefix = "（ペア候補）" if r.get("_pair_candidate") else ""
 
         subtitle = f"{job} / {sub}"
         depth_line = f"{depth}"
         if steps:
             depth_line += f" / 工程: {steps}"
 
-        stage_mark = _stage_hit_suffix(r)
+        stage_mark = _stage_hit_label(r)
         if stage_mark:
             depth_line += f" {stage_mark}"
 
@@ -213,7 +227,7 @@ def to_flex_message(results: List[dict]) -> dict:
                 "contents": [
                     {
                         "type":"text",
-                        "text": f"{prefix}{eff or '・'} {mech} + {cutter}",
+                        "text": f"{eff or '・'} {mech} + {cutter}",
                         "weight":"bold",
                         "wrap": True
                     },
@@ -234,6 +248,8 @@ def to_flex_message(results: List[dict]) -> dict:
         }]
 
     return {"type": "carousel", "contents": bubbles}
+
+# ---- 既存インターフェース（必要なら使用） ---------------------
 
 def qr_reset_and_exit():
     return [

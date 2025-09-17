@@ -1,14 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-app.py（シンプル版 v2.8）
-
-変更点:
-- v2.6 → v2.8
-  1) 深さ正規化の  を辞書版に変更（長さ不一致エラー修正）
-  2) DataFrame の真偽判定エラー回避（`df or DF` をやめ、None 明示判定に統一）
-  3) 深さ候補抽出を堅牢化（非文字/NaN混入でもOK）
-  4) /version で BOOT ログのコミット表示はそのまま
+app.py（v2.9）
 """
+
 from __future__ import annotations
 import os
 import re
@@ -46,8 +40,8 @@ CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 ALLOWED_USER_IDS = set(u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",") if u.strip())
 
-MAX_QUICKREPLIES = 12
-RESULTS_REFINE_THRESHOLD = 5
+MAX_QUICKREPLIES = int(os.environ.get("MAX_QUICKREPLIES", "7"))  # ←あなたのデフォルトに合わせて
+RESULTS_REFINE_THRESHOLD = int(os.environ.get("RESULTS_REFINE_THRESHOLD", "3"))
 
 # =============================
 # UTF-8 JSON
@@ -57,7 +51,7 @@ class UTF8JSONResponse(JSONResponse):
     def render(self, content: object) -> bytes:
         return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
-APP_VERSION = "app.py (simple v2.8)"
+APP_VERSION = "app.py (v2.9 depth-first & pair-label)"
 app = FastAPI(default_response_class=UTF8JSONResponse)
 
 # === Version meta ===
@@ -287,6 +281,7 @@ class Stage:
     CHOOSE_TASK = "CHOOSE_TASK"
     CHOOSE_BASE = "CHOOSE_BASE"
     ASK_OPTIONAL = "ASK_OPTIONAL"
+    CHOOSE_DEPTH = "CHOOSE_DEPTH"   # <- 追加：深さ/厚さを最優先で選ぶ
     CHOOSE_MACHINE_CAT = "CHOOSE_MACHINE_CAT"
     CHOOSE_MODEL = "CHOOSE_MODEL"
     SHOW_RESULTS = "SHOW_RESULTS"
@@ -307,6 +302,9 @@ class SearchSession:
         self.last_unfiltered_hits: List[Dict] = []
         # 多数時に提示する深さ/厚さ候補
         self.depth_options: List[str] = []
+        # 深さ優先制御
+        self.depth_first_mode: bool = False
+        self.depth_selected: Optional[str] = None
 
     def reset(self):
         self.__init__()
@@ -330,6 +328,12 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, Optional[str]]) -> pd.Dat
             q = q[q[key] == val]
     return q
 
+# 現在の「作業名＋下地」で出せる深さ候補（優先提示用）
+def _depth_opts_for_base(sess: SearchSession, limit: int = 8) -> List[str]:
+    base_filters = {k: v for k, v in sess.filters.items() if k in ("作業名", "下地の状況")}
+    base_df = apply_filters(DF, base_filters)
+    return _depth_candidates_from_df(base_df, limit=limit)
+
 # --- formatters に渡すための query dict を生成（リスト形式で） ---
 def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
     def _as_list(v: Optional[str]) -> List[str]:
@@ -339,7 +343,7 @@ def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
         "下地の状況": _as_list(sess.filters.get("下地の状況")),
         "機械カテゴリー": _as_list(sess.filters.get("機械カテゴリー")),
         "ライナックス機種名": _as_list(sess.filters.get("ライナックス機種名")),
-        "処理する深さ・厚さ": [],
+        "処理する深さ・厚さ": _as_list(sess.depth_selected),  
         "作業効率評価": [],
         "工程数": _as_list(sess.filters.get("工程数")),
     }
@@ -362,11 +366,13 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
     # ペア候補を補完
     augmented = prepare_with_pairs(cur_rows, prev_rows)
 
-    # ★ ここを追加：ペアで補完された行(_pair_candidate=True)は「検索対象でないペア工程」
-    #    ＝ ヒットではない。逆に、ペアでない行はヒット扱い。
+    # ★ ラベル付け：ヒット/ペアを明確化
     for r in augmented:
-        r["_hit_stage"] = not bool(r.get("_pair_candidate"))
-
+        is_pair = bool(r.get("_pair_candidate", False))  # ← dictから安全に取得
+        r["_hit_stage"] = (not is_pair)                  # 互換フラグ
+        r["_is_hit"] = (not is_pair)                     # 明示フラグ
+        r["_hit_label"] = "検索ヒットした工程" if not is_pair else "検索結果とペアになる工程"
+    
     # 一次/二次の並べ方を整える（postprocess.reorder_and_pair がある場合）
     try:
         augmented = reorder_and_pair(augmented)
@@ -392,6 +398,7 @@ ASK_OPTIONAL = (
     "2: ライナックス機種名から選ぶ\n"
     "3: このまま検索する"
 )
+ASK_DEPTH = "深さ/厚さを選んでください（※先に選ぶ必要があります）"
 ASK_MACHINE_CAT = "機械カテゴリーを選んでください"
 ASK_MODEL = "ライナックス機種名を選んでください"
 START_TEXT = WELCOME + "\n\n" + ASK_TASK
@@ -442,6 +449,9 @@ def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) ->
 # =============================
 def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str]) -> Dict[str, object]:
     results = apply_filters(DF, sess.filters)
+    # 深さが選択済みなら常に適用
+    if sess.depth_selected:
+        results = _filter_df_by_depth(results, sess.depth_selected)
     sess.last_results = results
 
     if results.empty:
@@ -454,12 +464,17 @@ def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str
     if len(results) >= RESULTS_REFINE_THRESHOLD:
         sess.stage = Stage.REFINE_MORE
         col, vals = next_refine_suggestions(results, used_optional)
-
-        # 深さ/厚さ候補を抽出して Quick に混ぜる
-        depth_opts = _depth_candidates_from_df(results)
+        # 深さ/厚さ候補（未選択のときだけ提示）
+        depth_opts = [] if sess.depth_selected else _depth_candidates_from_df(results)
         sess.depth_options = depth_opts[:]  # セッション保持
-        quick_opts = depth_opts + (vals or [])
-
+        # 深さ優先：深さが未選択で候補がある場合は、まず深さのみを提示
+        if depth_opts:
+            sess.stage = Stage.REFINE_MORE
+            return {
+                "text": f"該当 {len(results)} 件。\nまず『深さ/厚さ』で絞り込んでください。",
+                "quick": assemble_quick(depth_opts, ["やり直す", "終了"]),
+            }
+        quick_opts = vals or []
         if not quick_opts:
             # 何も出せない場合は即表示
             sess.stage = Stage.SHOW_RESULTS
@@ -527,10 +542,40 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
                 "quick": assemble_quick(base_options, ["やり直す", "終了"]),
             }
         sess.filters["下地の状況"] = choice
+        # ★ 深さ候補があれば必ず先に選ばせる
+        depth_opts = _depth_opts_for_base(sess)
+        if depth_opts:
+            sess.depth_first_mode = True
+            sess.depth_selected = None
+            sess.depth_options = depth_opts[:]
+            sess.stage = Stage.CHOOSE_DEPTH
+            return {
+                "text": f"『{choice}』を選択。\n\n" + ASK_DEPTH,
+                "quick": assemble_quick(depth_opts, ["やり直す", "終了"]),
+            }
+        # 深さ候補がない場合のみ通常の任意絞り込みへ
+        sess.depth_first_mode = False
+        sess.depth_selected = None
         sess.stage = Stage.ASK_OPTIONAL
         return {"text": f"『{choice}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
 
+    # ★ 新ステージ：深さ/厚さを最優先で選ぶ
+    if sess.stage == Stage.CHOOSE_DEPTH:
+        opts = sess.depth_options or _depth_opts_for_base(sess)
+        choice = resolve_choice(t, opts)
+        if not choice:
+            return {"text": "すみません、番号または候補から選んでください。\n" + ASK_DEPTH,
+                    "quick": assemble_quick(opts, ["やり直す", "終了"])}
+        sess.depth_selected = choice
+        # 深さを適用した状態で次へ
+        return _do_search_and_maybe_refine(sess, used_optional=None)
+        
     if sess.stage == Stage.ASK_OPTIONAL:
+        # 深さ優先モードで未選択なら、まず深さへ誘導
+        if sess.depth_first_mode and not sess.depth_selected:
+            sess.stage = Stage.CHOOSE_DEPTH
+            opts = sess.depth_options or _depth_opts_for_base(sess)
+            return {"text": "まず『深さ/厚さ』を選んでください。", "quick": assemble_quick(opts, ["やり直す", "終了"])}
         n = to_int_or_none(t)
         if n == 1:
             sess.stage = Stage.CHOOSE_MACHINE_CAT
@@ -573,14 +618,11 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
     if sess.stage == Stage.REFINE_MORE:
         col, vals = next_refine_suggestions(sess.last_results, _used_optional(sess))
-
-        # 直前の結果を必ず基準にする（None対策）
         base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else DF
-
-        # 表示候補（深さ/厚さ + 軸候補）
-        depth_now = _depth_candidates_from_df(base_df)
+        # 深さは未選択の時だけ提示（深さ優先を一貫）
+        depth_now = [] if sess.depth_selected else _depth_candidates_from_df(base_df)
         combined_opts = (depth_now or []) + (vals or [])
-
+        
         if not combined_opts:
             sess.stage = Stage.SHOW_RESULTS
             return {"text": build_results_text(sess, base_df), "quick": ["やり直す", "終了"]}
@@ -598,6 +640,7 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
         if depth_now and (choice in depth_now):
             filtered = _filter_df_by_depth(base_df, choice)
+            sess.depth_selected = choice  # ← 深さを固定
             msg_col_part = f"深さ/厚さ ≈ {choice}"
         else:
             if col:
@@ -613,7 +656,7 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
             next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
-            next_depth = _depth_candidates_from_df(filtered)
+            next_depth = [] if sess.depth_selected else _depth_candidates_from_df(filtered)
             return {
                 "text": f"『{msg_col_part}』で絞り込みました。(件数: {len(filtered)})\nさらに絞り込み可能です。",
                 "quick": assemble_quick((next_depth or []) + (next_vals or []), ["やり直す", "終了"]),
