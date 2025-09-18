@@ -147,8 +147,7 @@ def to_int_or_none(text: str) -> Optional[int]:
 
 def assemble_quick(options: List[str], controls: List[str] | Tuple[str, ...] = ()) -> List[str]:
     """
-    旧：候補も含めて上限をかけていた。
-    新：候補は本文で全件列挙するため、ここでは controls（やり直す/終了等）だけ詰める想定。
+    候補は本文で全件列挙するため、ここでは controls（やり直す/終了等）だけ詰める。
     """
     controls = [c for c in controls if c]
     limit_for_controls = MAX_QUICKREPLIES
@@ -191,7 +190,7 @@ def _normalize_depth_str(v: Optional[str]) -> Optional[str]:
     s = str(v).strip()
     if not s:
         return None
-    # 全角→半角
+    # 全角→半角・ゆれ吸収（約, 不等号, ±, 前後 等を除去/正規化）
     z2h = str.maketrans({
         "－": "-", "ー": "-",
         "０": "0","１": "1","２": "2","３": "3","４": "4",
@@ -199,12 +198,26 @@ def _normalize_depth_str(v: Optional[str]) -> Optional[str]:
         "．": ".", "。": ".",
         "〜": "~","～": "~",
         "㎜": "mm",
+        "≦": "<=", "≤": "<=", "≧": ">=", "≥": ">=",
     })
-    s = s.translate(z2h).replace(" ", "")
+    s = s.translate(z2h)
+    # ノイズ語を除去
+    s = (s.replace("約", "")
+           .replace("前後", "")
+           .replace("程度", "")
+           .replace("くらい", "")
+           .replace("ぐらい", "")
+           .replace("±", ""))
+    # 空白除去とハイフン揃え
+    s = s.replace(" ", "")
     s = s.replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-")
-    s = s.replace("~", "-")  # ~ を - に正規化（~b → -b）
+    # ~ を - に（~b → -b）
+    s = s.replace("~", "-")
+    # 不等号（<=x, >=x, <x, >x）はレンジに落とせるように保持（ここでは保持のみ）
+    # 単値なら mm 付与
     if re.fullmatch(r"\d+(?:\.\d+)?", s):
         s = s + "mm"
+    # "mm" を小文字に揃える
     s = re.sub(r"(?<=\d)\s*mm$", "mm", s, flags=re.I)
     return s
 
@@ -214,20 +227,29 @@ def _parse_depth_range_cell(cell: str) -> Optional[Tuple[float, float]]:
     t = (cell.replace("㎜", "mm")
               .replace("〜", "~").replace("～", "~")
               .replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-").replace("−", "-"))
-    # ★ 追加: -b（~b を正規化した形）を 0-b とみなす
+    # -b（~b を正規化した形）→ 0-b
     m = re.search(r"^\s*-\s*(\d+(?:\.\d+)?)", t)
     if m:
         hi = float(m.group(1))
         return (0.0, hi)
-
-    # a-b
+    # <=b / <b → 0-b とみなす
+    m = re.search(r"^\s*<\=?\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        hi = float(m.group(1))
+        return (0.0, hi)
+    # >=a / >a → a-∞ とみなす（実用は上限広めに）
+    m = re.search(r"^\s*>\=?\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        lo = float(m.group(1))
+        return (lo, float("inf"))
+    # a-b or a~b
     m = re.search(r"(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)", t)
     if m:
         lo = float(m.group(1)); hi = float(m.group(2))
         if lo > hi:
             lo, hi = hi, lo
         return (lo, hi)
-    # ~b （0-b と解釈）
+    # ~b （0-b）
     m = re.search(r"^\s*~\s*(\d+(?:\.\d+)?)", t)
     if m:
         hi = float(m.group(1))
@@ -240,17 +262,17 @@ def _parse_depth_range_cell(cell: str) -> Optional[Tuple[float, float]]:
     return None
 
 def _range_overlap(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+    # 端点接触は「重なる」とみなす
     return not (a[1] < b[0] or b[1] < a[0])
 
 def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 99999) -> List[str]:
-    """候補数制限なしに変更"""
+    """候補数制限なし"""
     vals = set()
     if "処理する深さ・厚さ" in df.columns:
         for v in df["処理する深さ・厚さ"].tolist():
             n = _normalize_depth_str(v if isinstance(v, str) else str(v) if v is not None else None)
             if n:
                 vals.add(n)
-    # 数値下限でソート（レンジは下限→幅）
     def keyfun(x: str):
         m = re.match(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?", x)
         if m:
@@ -263,15 +285,13 @@ def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 99999) -> List[str]
 def _filter_df_by_depth(df: pd.DataFrame, choice: str) -> pd.DataFrame:
     """選択文字列もセルも共通パーサで解釈して重なり判定"""
     want = _normalize_depth_str(choice) or ""
-    rng = _parse_depth_range_cell(want)  # ★ 共通パーサに統一
+    rng = _parse_depth_range_cell(want)
     if not rng:
         return df
     lo, hi = rng
-
     def ok(cell: str) -> bool:
-        r = _parse_depth_range_cell(cell or "")
+        r = _parse_depth_range_cell(_normalize_depth_str(cell) or "")
         return bool(r and _range_overlap(r, (lo, hi)))
-
     if "処理する深さ・厚さ" not in df.columns:
         return df
     mask = df["処理する深さ・厚さ"].apply(ok)
@@ -303,11 +323,11 @@ class SearchSession:
             "工程数": None,  # A/B/単一
         }
         self.last_results: Optional[pd.DataFrame] = None
-        self.last_unfiltered_hits: List[Dict] = []  # ペア補完用（作業名+下地のみ適用の直近ヒット）
+        self.last_unfiltered_hits: List[Dict] = []  # ペア補完用
         self.depth_options: List[str] = []
         self.depth_first_mode: bool = False
         self.depth_selected: Optional[str] = None
-        # ★ 追加：候補のフルセットを本文に列挙し、番号で選ばせる
+        # 全候補を本文に列挙→番号選択
         self.pending_kind: Optional[str] = None
         self.pending_options: List[str] = []
 
@@ -359,46 +379,50 @@ def _row_key(r: dict) -> tuple:
         r.get("工程数",""), r.get("処理する深さ・厚さ","")
     )
 
-# --- 結果のテキストを生成（ペア補完＋並び順＋件数ヘッダは formatters に任せる） ---
+# --- 結果のテキストを生成 ---
 def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
-    # 前段（未絞り込み）は「作業名＋下地」のみ適用
+    # ヒット（= depth含め適用済）をキー集合化
+    cur_rows = filtered_df.to_dict(orient="records")
+    cur_rows = _annotate_stage_flags(cur_rows)
+    cur_keys = { _row_key(r) for r in cur_rows }
+
+    # 「作業名＋下地」の未絞り込み for ペア補完
     base_filters = {k: v for k, v in sess.filters.items() if k in ("作業名", "下地の状況")}
     prev_df = apply_filters(DF, base_filters)
     prev_rows = prev_df.to_dict(orient="records")
     prev_rows = _annotate_stage_flags(prev_rows)
     sess.last_unfiltered_hits = prev_rows
 
-    # 現在の表示対象（= ヒット）
-    cur_rows = filtered_df.to_dict(orient="records")
-    cur_rows = _annotate_stage_flags(cur_rows)
-    cur_keys = { _row_key(r) for r in cur_rows }
-
     # ペア候補を補完
     augmented = prepare_with_pairs(cur_rows, prev_rows)
 
-    # ★ ラベル付け：ヒット/ペアを明確化（単一はラベル無し）
-    for r in augmented:
-        key_in_hit = (_row_key(r) in cur_keys)
-        is_single = ((_normalize_stage(r.get("工程数")) or "").upper() == "SINGLE")
+    # 並べ替え（ここで任意の処理で順序が変わってもOK）
+    try:
+        augmented = reorder_and_pair(augmented)
+    except Exception:
+        pass
 
+    # ★★★ 最終ラベリング：reorder 後に上書きするので、カスタムキーが落ちてもOK ★★★
+    # 1) まず「ヒット集合 membership」でヒット/ペアを初期付与
+    for r in augmented:
+        is_single = ((_normalize_stage(r.get("工程数")) or "").upper() == "SINGLE")
+        key_in_hit = (_row_key(r) in cur_keys)
         if is_single:
             r["_is_hit"] = key_in_hit
             r["_hit_stage"] = key_in_hit
-            r["_hit_label"] = ""  # 単一はラベル無し
-            continue
-
-        if key_in_hit:
-            r["_is_hit"] = True
-            r["_hit_stage"] = True
-            r["_hit_label"] = "検索ヒットした工程"
+            r["_hit_label"] = ""
         else:
-            r["_is_hit"] = False
-            r["_hit_stage"] = False
-            r["_hit_label"] = "検索結果とペアになる工程"
+            if key_in_hit:
+                r["_is_hit"] = True
+                r["_hit_stage"] = True
+                r["_hit_label"] = "検索ヒットした工程"
+            else:
+                r["_is_hit"] = False
+                r["_hit_stage"] = False
+                r["_hit_label"] = "検索結果とペアになる工程"
 
-    # === 追加：A/B が両方ヒットしている時は「片方だけヒット」に正規化 ===
+    # 2) A/B 両在グループは「必ず片方だけヒット」に正規化
     def _pair_group_key(r: dict) -> tuple:
-        # 工程以外でグルーピング（= A/B の片割れ関係をまとめる）
         return (
             r.get("作業名",""), r.get("下地の状況",""),
             r.get("ライナックス機種名",""), r.get("使用カッター名",""),
@@ -421,7 +445,7 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
     else:
         user_stage_pref = ""
 
-    for gkey, rows in groups.items():
+    for _, rows in groups.items():
         if len(rows) <= 1:
             continue
         chosen = None
@@ -431,7 +455,6 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
                     chosen = r
                     break
         if not chosen:
-            # デフォルト：A をヒット優先、無ければ B
             for pref in ("A", "B"):
                 for r in rows:
                     if (r.get("_stage") or "").upper() == pref:
@@ -439,7 +462,6 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
                         break
                 if chosen:
                     break
-        # 正規化：選ばれた1つだけヒット、他はペア
         for r in rows:
             if r is chosen:
                 r["_is_hit"] = True
@@ -449,12 +471,6 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
                 r["_is_hit"] = False
                 r["_hit_stage"] = False
                 r["_hit_label"] = "検索結果とペアになる工程"
-
-    # 一次/二次の並べ方を整える（あれば）
-    try:
-        augmented = reorder_and_pair(augmented)
-    except Exception:
-        pass
 
     qdict = _make_query_for_formatters(sess)
     return to_plain_text(augmented, qdict, explain="")
@@ -533,11 +549,9 @@ def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str
         combined_opts = (depth_opts or []) + (vals or [])
 
         if not combined_opts:
-            # 何も出せない場合は即表示
             sess.stage = Stage.SHOW_RESULTS
             return {"text": build_results_text(sess, results), "quick": assemble_quick([], ["やり直す", "終了"])}
 
-        # ★ 本文に全件列挙し、番号で選ばせる
         sess.pending_kind = "REFINE"
         sess.pending_options = combined_opts[:]
         msg = [f"該当 {len(results)} 件。"]
@@ -548,7 +562,6 @@ def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str
         body = "\n\n" + _numbered_list(combined_opts)
         return {"text": " ".join(msg) + body, "quick": assemble_quick([], ["やり直す", "終了"])}
 
-    # 少件数はすぐ表示（ペア候補付き）
     sess.stage = Stage.SHOW_RESULTS
     return {"text": build_results_text(sess, results), "quick": assemble_quick([], ["やり直す", "終了"])}
 
@@ -584,14 +597,12 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
     if t in ("やり直す", "reset", "リセット"):
         sess.reset()
         sess.stage = Stage.CHOOSE_TASK
-        # 作業名は番号列挙
         opts = ALL_UNIQUE["作業名"]
         text = START_TEXT + "\n\n" + _numbered_list(opts)
         sess.pending_kind = "作業名"
         sess.pending_options = opts[:]
         return {"text": text, "quick": assemble_quick([], ["終了"])}
 
-    # セッション未開始 → 初期表示
     if sess.stage == Stage.IDLE:
         sess.stage = Stage.CHOOSE_TASK
         opts = ALL_UNIQUE["作業名"]
@@ -600,7 +611,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         sess.pending_options = opts[:]
         return {"text": text, "quick": assemble_quick([], ["終了"])}
 
-    # 作業名選択（番号/テキスト両対応）
     if sess.stage == Stage.CHOOSE_TASK:
         if sess.pending_kind != "作業名" or not sess.pending_options:
             sess.pending_kind = "作業名"
@@ -611,13 +621,11 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             return {"text": text, "quick": assemble_quick([], ["終了"])}
         sess.filters["作業名"] = choice
 
-        # 次：下地の状況（全件列挙、1件ならバイパス）
         sess.stage = Stage.CHOOSE_BASE
         base_options = _unique_filtered("下地の状況", sess)
         if len(base_options) == 1:
             only = base_options[0]
             sess.filters["下地の状況"] = only
-            # 深さ候補があれば深さ優先へ
             depth_opts = _depth_opts_for_base(sess)
             if depth_opts:
                 sess.depth_first_mode = True
@@ -625,14 +633,12 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
                 sess.depth_options = depth_opts[:]
                 sess.stage = Stage.CHOOSE_DEPTH
                 if len(depth_opts) == 1:
-                    # 深さも1件なら即適用して検索
                     sess.depth_selected = depth_opts[0]
                     return _do_search_and_maybe_refine(sess, used_optional=None)
                 sess.pending_kind = "処理する深さ・厚さ"
                 sess.pending_options = depth_opts[:]
                 text = f"『{choice}』を選択。\n\n{ASK_DEPTH}\n\n" + _numbered_list(depth_opts)
                 return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
-            # 深さ候補が無ければ任意絞り込み
             sess.depth_first_mode = False
             sess.depth_selected = None
             return {"text": f"『{choice} / {only}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
@@ -642,7 +648,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             text = f"『{choice}』を選択。\n\n{ASK_BASE}\n\n" + _numbered_list(base_options)
             return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
 
-    # 下地の状況
     if sess.stage == Stage.CHOOSE_BASE:
         if sess.pending_kind != "下地の状況" or not sess.pending_options:
             base_options = _unique_filtered("下地の状況", sess)
@@ -654,7 +659,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         sess.filters["下地の状況"] = choice
 
-        # 深さ候補があれば深さ優先へ（1件なら自動決定）
         depth_opts = _depth_opts_for_base(sess)
         if depth_opts:
             sess.depth_first_mode = True
@@ -663,19 +667,16 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             sess.stage = Stage.CHOOSE_DEPTH
             if len(depth_opts) == 1:
                 sess.depth_selected = depth_opts[0]
-                # 深さ適用後に即検索 or 追加絞り込み
                 return _do_search_and_maybe_refine(sess, used_optional=None)
             sess.pending_kind = "処理する深さ・厚さ"
             sess.pending_options = depth_opts[:]
             text = f"『{choice}』を選択。\n\n{ASK_DEPTH}\n\n" + _numbered_list(depth_opts)
             return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
-        # 深さ候補がない場合のみ通常の任意絞り込みへ
         sess.depth_first_mode = False
         sess.depth_selected = None
         sess.stage = Stage.ASK_OPTIONAL
         return {"text": f"『{choice}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
 
-    # 深さ/厚さ（番号選択）
     if sess.stage == Stage.CHOOSE_DEPTH:
         if sess.pending_kind != "処理する深さ・厚さ" or not sess.pending_options:
             opts = sess.depth_options or _depth_opts_for_base(sess)
@@ -686,11 +687,9 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             text = ASK_DEPTH + "\n\n" + _numbered_list(sess.pending_options)
             return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         sess.depth_selected = choice
-        # 深さを適用した状態で次へ
         return _do_search_and_maybe_refine(sess, used_optional=None)
 
     if sess.stage == Stage.ASK_OPTIONAL:
-        # 深さ優先モードで未選択なら、まず深さへ誘導
         if sess.depth_first_mode and not sess.depth_selected:
             sess.stage = Stage.CHOOSE_DEPTH
             opts = sess.depth_options or _depth_opts_for_base(sess)
@@ -743,7 +742,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         return _do_search_and_maybe_refine(sess, used_optional="ライナックス機種名")
 
     if sess.stage == Stage.REFINE_MORE:
-        # 直前に提示した combined_opts の中から選んでもらう
         if sess.pending_kind != "REFINE" or not sess.pending_options:
             base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else DF
             col, vals = next_refine_suggestions(base_df, _used_optional(sess))
@@ -762,13 +760,12 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         col, vals = next_refine_suggestions(base_df, _used_optional(sess))
         depth_now = [] if sess.depth_selected else _depth_candidates_from_df(base_df)
 
-        # === 実際の絞り込み ===
         filtered = base_df
         msg_col_part = ""
 
         if depth_now and (choice in depth_now):
             filtered = _filter_df_by_depth(base_df, choice)
-            sess.depth_selected = choice  # 深さを固定
+            sess.depth_selected = choice
             msg_col_part = f"深さ/厚さ ≈ {choice}"
         else:
             if col and (choice in (vals or [])):
@@ -777,7 +774,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
                 if col == "工程数":
                     sess.filters["工程数"] = choice
             else:
-                # 何らかの直接一致（安全側で同値フィルタを試みる）
                 for c in ["機械カテゴリー", "ライナックス機種名", "作業効率評価", "工程数"]:
                     if c in base_df.columns and choice in base_df[c].unique().tolist():
                         filtered = base_df[base_df[c] == choice]
@@ -788,7 +784,7 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
                 if not msg_col_part:
                     msg_col_part = f"{choice}"
 
-        sess.last_results = filtered  # 次の候補計算の基準
+        sess.last_results = filtered
 
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
             next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
@@ -809,7 +805,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
     if sess.stage == Stage.SHOW_RESULTS:
         return {"text": "新しい検索を始めるには『やり直す』を送ってください。", "quick": ["やり直す", "終了"]}
 
-    # フォールバック：作業名に戻す
     sess.stage = Stage.CHOOSE_TASK
     opts = ALL_UNIQUE["作業名"]
     text = START_TEXT + "\n\n" + _numbered_list(opts)
@@ -820,7 +815,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 # =============================
 # FastAPI ルーティング
 # =============================
-# "/" に HEAD も許可（監視ツール対策）
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ok", "msg": APP_VERSION}
@@ -919,7 +913,6 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
         user_key = _source_key(src)
         out = handle_text(user_key, raw_text)
 
-        # Quick Reply は制御ボタンのみ（やり直す/終了など）
         quick = out.get("quick", [])
         actions: List[MessageAction] = []
         for lbl in quick[:MAX_QUICKREPLIES]:
