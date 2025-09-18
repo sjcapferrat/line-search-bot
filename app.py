@@ -112,7 +112,7 @@ def load_dataframe(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"CSV列が不足: {missing}")
     for c in REQUIRED_COLUMNS:
-        df[c] = df[c].fillna("").astype(str).str.strip()  # ← strip を追加（空白起因の不一致防止）
+        df[c] = df[c].fillna("").astype(str).str.strip()  # 空白起因の不一致防止
     return df
 
 DF = load_dataframe(CSV_PATH)
@@ -202,7 +202,7 @@ def _normalize_depth_str(v: Optional[str]) -> Optional[str]:
     })
     s = s.translate(z2h).replace(" ", "")
     s = s.replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-")
-    s = s.replace("~", "-")
+    s = s.replace("~", "-")  # ~ を - に正規化（~b → -b）
     if re.fullmatch(r"\d+(?:\.\d+)?", s):
         s = s + "mm"
     s = re.sub(r"(?<=\d)\s*mm$", "mm", s, flags=re.I)
@@ -214,6 +214,12 @@ def _parse_depth_range_cell(cell: str) -> Optional[Tuple[float, float]]:
     t = (cell.replace("㎜", "mm")
               .replace("〜", "~").replace("～", "~")
               .replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-").replace("−", "-"))
+    # ★ 追加: -b（~b を正規化した形）を 0-b とみなす
+    m = re.search(r"^\s*-\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        hi = float(m.group(1))
+        return (0.0, hi)
+
     # a-b
     m = re.search(r"(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)", t)
     if m:
@@ -221,7 +227,7 @@ def _parse_depth_range_cell(cell: str) -> Optional[Tuple[float, float]]:
         if lo > hi:
             lo, hi = hi, lo
         return (lo, hi)
-    # ~b （0-b）
+    # ~b （0-b と解釈）
     m = re.search(r"^\s*~\s*(\d+(?:\.\d+)?)", t)
     if m:
         hi = float(m.group(1))
@@ -255,20 +261,21 @@ def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 99999) -> List[str]
     return sorted(vals, key=keyfun)[:limit]
 
 def _filter_df_by_depth(df: pd.DataFrame, choice: str) -> pd.DataFrame:
+    """選択文字列もセルも共通パーサで解釈して重なり判定"""
     want = _normalize_depth_str(choice) or ""
-    m = re.match(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?", want)
-    if not m:
+    rng = _parse_depth_range_cell(want)  # ★ 共通パーサに統一
+    if not rng:
         return df
-    lo = float(m.group(1))
-    hi = float(m.group(2)) if m.group(2) else lo
+    lo, hi = rng
+
     def ok(cell: str) -> bool:
-        rng = _parse_depth_range_cell(cell or "")
-        return bool(rng and _range_overlap(rng, (lo, hi)))
+        r = _parse_depth_range_cell(cell or "")
+        return bool(r and _range_overlap(r, (lo, hi)))
+
     if "処理する深さ・厚さ" not in df.columns:
         return df
     mask = df["処理する深さ・厚さ"].apply(ok)
-    out = df[mask]
-    return out
+    return df[mask]
 # -------------------------------------------------------------
 
 # =============================
@@ -388,6 +395,60 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
             r["_is_hit"] = False
             r["_hit_stage"] = False
             r["_hit_label"] = "検索結果とペアになる工程"
+
+    # === 追加：A/B が両方ヒットしている時は「片方だけヒット」に正規化 ===
+    def _pair_group_key(r: dict) -> tuple:
+        # 工程以外でグルーピング（= A/B の片割れ関係をまとめる）
+        return (
+            r.get("作業名",""), r.get("下地の状況",""),
+            r.get("ライナックス機種名",""), r.get("使用カッター名",""),
+            r.get("処理する深さ・厚さ","")
+        )
+
+    groups: Dict[tuple, List[dict]] = {}
+    for r in augmented:
+        st = (r.get("_stage") or "").upper()
+        if st in ("A", "B"):
+            groups.setdefault(_pair_group_key(r), []).append(r)
+
+    user_stage_pref = (sess.filters.get("工程数") or "").strip().upper()
+    if "一次" in user_stage_pref or user_stage_pref.startswith("A"):
+        user_stage_pref = "A"
+    elif "二次" in user_stage_pref or user_stage_pref.startswith("B"):
+        user_stage_pref = "B"
+    elif "単一" in user_stage_pref or "SINGLE" in user_stage_pref:
+        user_stage_pref = "SINGLE"
+    else:
+        user_stage_pref = ""
+
+    for gkey, rows in groups.items():
+        if len(rows) <= 1:
+            continue
+        chosen = None
+        if user_stage_pref in ("A", "B"):
+            for r in rows:
+                if (r.get("_stage") or "").upper() == user_stage_pref:
+                    chosen = r
+                    break
+        if not chosen:
+            # デフォルト：A をヒット優先、無ければ B
+            for pref in ("A", "B"):
+                for r in rows:
+                    if (r.get("_stage") or "").upper() == pref:
+                        chosen = r
+                        break
+                if chosen:
+                    break
+        # 正規化：選ばれた1つだけヒット、他はペア
+        for r in rows:
+            if r is chosen:
+                r["_is_hit"] = True
+                r["_hit_stage"] = True
+                r["_hit_label"] = "検索ヒットした工程"
+            else:
+                r["_is_hit"] = False
+                r["_hit_stage"] = False
+                r["_hit_label"] = "検索結果とペアになる工程"
 
     # 一次/二次の並べ方を整える（あれば）
     try:
@@ -523,7 +584,7 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
     if t in ("やり直す", "reset", "リセット"):
         sess.reset()
         sess.stage = Stage.CHOOSE_TASK
-        # 作業名は従来の簡易提示のまま（必要なら番号列挙に拡張可）
+        # 作業名は番号列挙
         opts = ALL_UNIQUE["作業名"]
         text = START_TEXT + "\n\n" + _numbered_list(opts)
         sess.pending_kind = "作業名"
