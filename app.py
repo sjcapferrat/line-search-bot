@@ -261,25 +261,23 @@ def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 8) -> List[str]:
 
 def _filter_df_by_depth(df: pd.DataFrame, choice: str) -> pd.DataFrame:
     """
-    choice: _depth_candidates_from_df で提示した値（例: '0.7mm' / '0.5-1.0mm'）
-    行側の「処理する深さ・厚さ」レンジと重なりがある行のみ残す。
+    深さ/厚さは『候補で選んだ表記（正規化後）と完全一致』で抽出する。
+    例: choice='6.0-12.0mm' を選んだら CSV の '処理する深さ・厚さ'
+        が正規化後に '6.0-12.0mm' になる行だけを返す。
     """
-    want = _normalize_depth_str(choice) or ""
-    m = re.match(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?", want)
-    if not m:
-        return df
-    lo = float(m.group(1))
-    hi = float(m.group(2)) if m.group(2) else lo
-
-    def ok(cell: str) -> bool:
-        rng = _parse_depth_range_cell(cell or "")
-        return bool(rng and _range_overlap(rng, (lo, hi)))
-
     if "処理する深さ・厚さ" not in df.columns:
         return df
-    mask = df["処理する深さ・厚さ"].apply(ok)
-    out = df[mask]
-    return out
+
+    want = _normalize_depth_str(choice) or ""
+    if not want:
+        return df
+
+    def norm_cell(x: str) -> str:
+        return _normalize_depth_str(x) or ""
+
+    mask = df["処理する深さ・厚さ"].apply(lambda x: norm_cell(x) == want)
+    return df[mask]
+
 # -------------------------------------------------------------
 
 # =============================
