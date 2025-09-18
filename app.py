@@ -17,7 +17,12 @@ import pandas as pd
 # === 表示とペア補完ユーティリティ ===
 from formatters import to_plain_text  # 件数ヘッダ・空行・並び順・（ペア候補）表示＋工程ラベル
 from search_core import prepare_with_pairs  # ペア候補を未絞り込み結果から補完
-from postprocess import reorder_and_pair    # あれば利用（一次/二次の並び整形）
+# あれば利用（一次/二次の並び整形）※無くても起動可能に
+try:
+    from postprocess import reorder_and_pair
+except Exception:
+    def reorder_and_pair(rows):
+        return rows
 
 # ====== LINE SDK（未設定ならダミーで起動可能） ======
 try:
@@ -40,7 +45,7 @@ CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 ALLOWED_USER_IDS = set(u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",") if u.strip())
 
-MAX_QUICKREPLIES = int(os.environ.get("MAX_QUICKREPLIES", "7"))  # ←あなたのデフォルトに合わせて
+MAX_QUICKREPLIES = int(os.environ.get("MAX_QUICKREPLIES", "7"))  # 制御ボタンのみで使用
 RESULTS_REFINE_THRESHOLD = int(os.environ.get("RESULTS_REFINE_THRESHOLD", "3"))
 
 # =============================
@@ -81,7 +86,7 @@ def version():
 @app.on_event("startup")
 async def _boot_log():
     logger.info(f"[BOOT] {APP_VERSION} commit={GIT_SHA}")
-    
+
 # =============================
 # データ読み込み
 # =============================
@@ -107,7 +112,7 @@ def load_dataframe(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"CSV列が不足: {missing}")
     for c in REQUIRED_COLUMNS:
-        df[c] = df[c].fillna("").astype(str)
+        df[c] = df[c].fillna("").astype(str).str.strip()  # ← strip を追加（空白起因の不一致防止）
     return df
 
 DF = load_dataframe(CSV_PATH)
@@ -141,12 +146,19 @@ def to_int_or_none(text: str) -> Optional[int]:
     return None
 
 def assemble_quick(options: List[str], controls: List[str] | Tuple[str, ...] = ()) -> List[str]:
+    """
+    旧：候補も含めて上限をかけていた。
+    新：候補は本文で全件列挙するため、ここでは controls（やり直す/終了等）だけ詰める想定。
+    """
     controls = [c for c in controls if c]
-    limit_for_options = max(0, MAX_QUICKREPLIES - len(controls))
-    return options[:limit_for_options] + controls
+    limit_for_controls = MAX_QUICKREPLIES
+    return controls[:limit_for_controls]
 
 def clip_label(label: str, maxlen: int = 20) -> str:
     return label if len(label) <= maxlen else (label[: maxlen - 1] + "…")
+
+def _numbered_list(options: List[str]) -> str:
+    return "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, 1))
 
 # ---- 工程正規化とフラグ付与 --------------------------------
 def _normalize_stage(raw: Optional[str]) -> Optional[str]:
@@ -160,12 +172,6 @@ def _normalize_stage(raw: Optional[str]) -> Optional[str]:
     if s.startswith("B") or "二次" in s or "二次工程" in s:
         return "B"
     return None
-
-def _stage_hit_flag(row_stage_norm: Optional[str], stage_filter_val: Optional[str]) -> bool:
-    if not stage_filter_val:
-        return False
-    want = _normalize_stage(stage_filter_val)
-    return (want is not None) and (row_stage_norm == want)
 
 def _annotate_stage_flags(rows: List[Dict]) -> List[Dict]:
     out = []
@@ -185,23 +191,20 @@ def _normalize_depth_str(v: Optional[str]) -> Optional[str]:
     s = str(v).strip()
     if not s:
         return None
-    # 全角→半角（辞書版：1:1 マッピング）
+    # 全角→半角
     z2h = str.maketrans({
-        "－": "-", "ー": "-",  # 長音もハイフン扱い（保険）
+        "－": "-", "ー": "-",
         "０": "0","１": "1","２": "2","３": "3","４": "4",
         "５": "5","６": "6","７": "7","８": "8","９": "9",
-        "．": ".", "。": ".",  # 句点混入の保険
-        "〜": "~","～": "~",   # 波ダッシュを ~ に
+        "．": ".", "。": ".",
+        "〜": "~","～": "~",
         "㎜": "mm",
     })
     s = s.translate(z2h).replace(" ", "")
-    # ハイフン/ダッシュ類を揃える → 最後に ~ は - 扱いへ
     s = s.replace("–", "-").replace("—", "-").replace("―", "-").replace("‐", "-")
     s = s.replace("~", "-")
-    # 単値なら mm を付与
     if re.fullmatch(r"\d+(?:\.\d+)?", s):
         s = s + "mm"
-    # "mm" を小文字に揃える
     s = re.sub(r"(?<=\d)\s*mm$", "mm", s, flags=re.I)
     return s
 
@@ -218,7 +221,7 @@ def _parse_depth_range_cell(cell: str) -> Optional[Tuple[float, float]]:
         if lo > hi:
             lo, hi = hi, lo
         return (lo, hi)
-    # ~b （0-b と解釈）
+    # ~b （0-b）
     m = re.search(r"^\s*~\s*(\d+(?:\.\d+)?)", t)
     if m:
         hi = float(m.group(1))
@@ -233,7 +236,8 @@ def _parse_depth_range_cell(cell: str) -> Optional[Tuple[float, float]]:
 def _range_overlap(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
     return not (a[1] < b[0] or b[1] < a[0])
 
-def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 8) -> List[str]:
+def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 99999) -> List[str]:
+    """候補数制限なしに変更"""
     vals = set()
     if "処理する深さ・厚さ" in df.columns:
         for v in df["処理する深さ・厚さ"].tolist():
@@ -251,21 +255,15 @@ def _depth_candidates_from_df(df: pd.DataFrame, limit: int = 8) -> List[str]:
     return sorted(vals, key=keyfun)[:limit]
 
 def _filter_df_by_depth(df: pd.DataFrame, choice: str) -> pd.DataFrame:
-    """
-    choice: _depth_candidates_from_df で提示した値（例: '0.7mm' / '0.5-1.0mm'）
-    行側の「処理する深さ・厚さ」レンジと重なりがある行のみ残す。
-    """
     want = _normalize_depth_str(choice) or ""
     m = re.match(r"(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?", want)
     if not m:
         return df
     lo = float(m.group(1))
     hi = float(m.group(2)) if m.group(2) else lo
-
     def ok(cell: str) -> bool:
         rng = _parse_depth_range_cell(cell or "")
         return bool(rng and _range_overlap(rng, (lo, hi)))
-
     if "処理する深さ・厚さ" not in df.columns:
         return df
     mask = df["処理する深さ・厚さ"].apply(ok)
@@ -281,7 +279,7 @@ class Stage:
     CHOOSE_TASK = "CHOOSE_TASK"
     CHOOSE_BASE = "CHOOSE_BASE"
     ASK_OPTIONAL = "ASK_OPTIONAL"
-    CHOOSE_DEPTH = "CHOOSE_DEPTH"   # <- 追加：深さ/厚さを最優先で選ぶ
+    CHOOSE_DEPTH = "CHOOSE_DEPTH"   # 深さ/厚さを最優先で選ぶ
     CHOOSE_MACHINE_CAT = "CHOOSE_MACHINE_CAT"
     CHOOSE_MODEL = "CHOOSE_MODEL"
     SHOW_RESULTS = "SHOW_RESULTS"
@@ -295,16 +293,16 @@ class SearchSession:
             "下地の状況": None,
             "機械カテゴリー": None,
             "ライナックス機種名": None,
-            "工程数": None,  # NEW: 工程数フィルタ保持（A/B/単一）
+            "工程数": None,  # A/B/単一
         }
         self.last_results: Optional[pd.DataFrame] = None
-        # ペア補完用に「未絞り込み（=作業名+下地）」の直近ヒットを保持
-        self.last_unfiltered_hits: List[Dict] = []
-        # 多数時に提示する深さ/厚さ候補
+        self.last_unfiltered_hits: List[Dict] = []  # ペア補完用（作業名+下地のみ適用の直近ヒット）
         self.depth_options: List[str] = []
-        # 深さ優先制御
         self.depth_first_mode: bool = False
         self.depth_selected: Optional[str] = None
+        # ★ 追加：候補のフルセットを本文に列挙し、番号で選ばせる
+        self.pending_kind: Optional[str] = None
+        self.pending_options: List[str] = []
 
     def reset(self):
         self.__init__()
@@ -328,13 +326,11 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, Optional[str]]) -> pd.Dat
             q = q[q[key] == val]
     return q
 
-# 現在の「作業名＋下地」で出せる深さ候補（優先提示用）
-def _depth_opts_for_base(sess: SearchSession, limit: int = 8) -> List[str]:
+def _depth_opts_for_base(sess: SearchSession, limit: int = 99999) -> List[str]:
     base_filters = {k: v for k, v in sess.filters.items() if k in ("作業名", "下地の状況")}
     base_df = apply_filters(DF, base_filters)
     return _depth_candidates_from_df(base_df, limit=limit)
 
-# --- formatters に渡すための query dict を生成（リスト形式で） ---
 def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
     def _as_list(v: Optional[str]) -> List[str]:
         return [v] if v else []
@@ -343,10 +339,18 @@ def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
         "下地の状況": _as_list(sess.filters.get("下地の状況")),
         "機械カテゴリー": _as_list(sess.filters.get("機械カテゴリー")),
         "ライナックス機種名": _as_list(sess.filters.get("ライナックス機種名")),
-        "処理する深さ・厚さ": _as_list(sess.depth_selected),  
+        "処理する深さ・厚さ": _as_list(sess.depth_selected),
         "作業効率評価": [],
         "工程数": _as_list(sess.filters.get("工程数")),
     }
+
+# --- キー化して“ヒット集合”を追跡（ペア工程のラベル分離に使用） ---
+def _row_key(r: dict) -> tuple:
+    return (
+        r.get("作業名",""), r.get("下地の状況",""),
+        r.get("ライナックス機種名",""), r.get("使用カッター名",""),
+        r.get("工程数",""), r.get("処理する深さ・厚さ","")
+    )
 
 # --- 結果のテキストを生成（ペア補完＋並び順＋件数ヘッダは formatters に任せる） ---
 def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
@@ -354,26 +358,38 @@ def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
     base_filters = {k: v for k, v in sess.filters.items() if k in ("作業名", "下地の状況")}
     prev_df = apply_filters(DF, base_filters)
     prev_rows = prev_df.to_dict(orient="records")
+    prev_rows = _annotate_stage_flags(prev_rows)
     sess.last_unfiltered_hits = prev_rows
 
-    # 現在の表示対象
+    # 現在の表示対象（= ヒット）
     cur_rows = filtered_df.to_dict(orient="records")
-
-    # _stage/_hit_stage を付与してからペア補完
     cur_rows = _annotate_stage_flags(cur_rows)
-    prev_rows = _annotate_stage_flags(prev_rows)
+    cur_keys = { _row_key(r) for r in cur_rows }
 
     # ペア候補を補完
     augmented = prepare_with_pairs(cur_rows, prev_rows)
 
-    # ★ ラベル付け：ヒット/ペアを明確化
+    # ★ ラベル付け：ヒット/ペアを明確化（単一はラベル無し）
     for r in augmented:
-        is_pair = bool(r.get("_pair_candidate", False))  # ← dictから安全に取得
-        r["_hit_stage"] = (not is_pair)                  # 互換フラグ
-        r["_is_hit"] = (not is_pair)                     # 明示フラグ
-        r["_hit_label"] = "検索ヒットした工程" if not is_pair else "検索結果とペアになる工程"
-    
-    # 一次/二次の並べ方を整える（postprocess.reorder_and_pair がある場合）
+        key_in_hit = (_row_key(r) in cur_keys)
+        is_single = ((_normalize_stage(r.get("工程数")) or "").upper() == "SINGLE")
+
+        if is_single:
+            r["_is_hit"] = key_in_hit
+            r["_hit_stage"] = key_in_hit
+            r["_hit_label"] = ""  # 単一はラベル無し
+            continue
+
+        if key_in_hit:
+            r["_is_hit"] = True
+            r["_hit_stage"] = True
+            r["_hit_label"] = "検索ヒットした工程"
+        else:
+            r["_is_hit"] = False
+            r["_hit_stage"] = False
+            r["_hit_label"] = "検索結果とペアになる工程"
+
+    # 一次/二次の並べ方を整える（あれば）
     try:
         augmented = reorder_and_pair(augmented)
     except Exception:
@@ -391,16 +407,16 @@ WELCOME = (
     "（ヒント: 途中で『やり直す』『終了』と入力できます）"
 )
 ASK_TASK = "作業名を選んでください"
-ASK_BASE = "下地の状況を選んでください"
+ASK_BASE = "下地の状況を番号で選んでください"
 ASK_OPTIONAL = (
     "任意で更に絞り込みますか？\n"
     "1: 機械カテゴリーから選ぶ\n"
     "2: ライナックス機種名から選ぶ\n"
     "3: このまま検索する"
 )
-ASK_DEPTH = "深さ/厚さを選んでください（※先に選ぶ必要があります）"
-ASK_MACHINE_CAT = "機械カテゴリーを選んでください"
-ASK_MODEL = "ライナックス機種名を選んでください"
+ASK_DEPTH = "深さ/厚さを番号で選んでください（※先に選ぶ必要があります）"
+ASK_MACHINE_CAT = "機械カテゴリーを番号で選んでください"
+ASK_MODEL = "ライナックス機種名を番号で選んでください"
 START_TEXT = WELCOME + "\n\n" + ASK_TASK
 
 def _used_optional(sess: SearchSession) -> Optional[str]:
@@ -418,18 +434,62 @@ def _unique_filtered(column: str, sess: SearchSession) -> List[str]:
         vals = ALL_UNIQUE[column]
     return vals
 
-def resolve_choice(text: str, options: List[str]) -> Optional[str]:
+def _resolve_from_pending(sess: SearchSession, text: str) -> Optional[str]:
     t = (text or "").strip()
     n = to_int_or_none(t)
-    if n is not None:
-        idx = n - 1
-        if 0 <= idx < len(options):
-            return options[idx]
-        return None
-    for opt in options:
+    if n is not None and 1 <= n <= len(sess.pending_options):
+        return sess.pending_options[n - 1]
+    for opt in sess.pending_options:
         if t == opt:
             return opt
     return None
+
+# =============================
+# 検索→表示
+# =============================
+def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str]) -> Dict[str, object]:
+    results = apply_filters(DF, sess.filters)
+    # 深さが選択済みなら常に適用
+    if sess.depth_selected:
+        results = _filter_df_by_depth(results, sess.depth_selected)
+    sess.last_results = results
+
+    # ペンディング候補はクリア
+    sess.pending_kind = None
+    sess.pending_options = []
+
+    if results.empty:
+        sess.stage = Stage.CHOOSE_TASK
+        return {
+            "text": "該当がありませんでした。条件を見直してください。\n\nまず『作業名』から選び直しましょう。",
+            "quick": assemble_quick([], ["終了"]),
+        }
+
+    if len(results) >= RESULTS_REFINE_THRESHOLD:
+        sess.stage = Stage.REFINE_MORE
+        col, vals = next_refine_suggestions(results, used_optional=None)
+        depth_opts = [] if sess.depth_selected else _depth_candidates_from_df(results)
+        combined_opts = (depth_opts or []) + (vals or [])
+
+        if not combined_opts:
+            # 何も出せない場合は即表示
+            sess.stage = Stage.SHOW_RESULTS
+            return {"text": build_results_text(sess, results), "quick": assemble_quick([], ["やり直す", "終了"])}
+
+        # ★ 本文に全件列挙し、番号で選ばせる
+        sess.pending_kind = "REFINE"
+        sess.pending_options = combined_opts[:]
+        msg = [f"該当 {len(results)} 件。"]
+        if depth_opts:
+            msg.append("まず『深さ/厚さ』で絞り込むこともできます。")
+        if col and vals:
+            msg.append(f"または『{col}』で更に絞り込めます。")
+        body = "\n\n" + _numbered_list(combined_opts)
+        return {"text": " ".join(msg) + body, "quick": assemble_quick([], ["やり直す", "終了"])}
+
+    # 少件数はすぐ表示（ペア候補付き）
+    sess.stage = Stage.SHOW_RESULTS
+    return {"text": build_results_text(sess, results), "quick": assemble_quick([], ["やり直す", "終了"])}
 
 def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) -> Tuple[str, List[str]]:
     if used_optional == "機械カテゴリー":
@@ -443,56 +503,6 @@ def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) ->
         if len(vals) >= 2:
             return col, vals
     return "", []
-
-# =============================
-# 検索→表示
-# =============================
-def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str]) -> Dict[str, object]:
-    results = apply_filters(DF, sess.filters)
-    # 深さが選択済みなら常に適用
-    if sess.depth_selected:
-        results = _filter_df_by_depth(results, sess.depth_selected)
-    sess.last_results = results
-
-    if results.empty:
-        sess.stage = Stage.CHOOSE_TASK
-        return {
-            "text": "該当がありませんでした。条件を見直してください。\n\nまず『作業名』から選び直しましょう。",
-            "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"]),
-        }
-
-    if len(results) >= RESULTS_REFINE_THRESHOLD:
-        sess.stage = Stage.REFINE_MORE
-        col, vals = next_refine_suggestions(results, used_optional)
-        # 深さ/厚さ候補（未選択のときだけ提示）
-        depth_opts = [] if sess.depth_selected else _depth_candidates_from_df(results)
-        sess.depth_options = depth_opts[:]  # セッション保持
-        # 深さ優先：深さが未選択で候補がある場合は、まず深さのみを提示
-        if depth_opts:
-            sess.stage = Stage.REFINE_MORE
-            return {
-                "text": f"該当 {len(results)} 件。\nまず『深さ/厚さ』で絞り込んでください。",
-                "quick": assemble_quick(depth_opts, ["やり直す", "終了"]),
-            }
-        quick_opts = vals or []
-        if not quick_opts:
-            # 何も出せない場合は即表示
-            sess.stage = Stage.SHOW_RESULTS
-            return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
-
-        msg = f"該当 {len(results)} 件。"
-        if col and vals:
-            msg += f"『{col}』で更に絞り込めます。"
-        if depth_opts:
-            msg += "\nまたは『深さ/厚さ』で絞り込めます。"
-        return {
-            "text": msg,
-            "quick": assemble_quick(quick_opts, ["やり直す", "終了"]),
-        }
-
-    # 少件数はすぐ表示（ペア候補付き）
-    sess.stage = Stage.SHOW_RESULTS
-    return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
 
 # =============================
 # テキストハンドラ
@@ -513,126 +523,183 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
     if t in ("やり直す", "reset", "リセット"):
         sess.reset()
         sess.stage = Stage.CHOOSE_TASK
-        return {"text": START_TEXT, "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"])}
+        # 作業名は従来の簡易提示のまま（必要なら番号列挙に拡張可）
+        opts = ALL_UNIQUE["作業名"]
+        text = START_TEXT + "\n\n" + _numbered_list(opts)
+        sess.pending_kind = "作業名"
+        sess.pending_options = opts[:]
+        return {"text": text, "quick": assemble_quick([], ["終了"])}
 
+    # セッション未開始 → 初期表示
     if sess.stage == Stage.IDLE:
         sess.stage = Stage.CHOOSE_TASK
-        return {"text": START_TEXT, "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"])}
+        opts = ALL_UNIQUE["作業名"]
+        text = START_TEXT + "\n\n" + _numbered_list(opts)
+        sess.pending_kind = "作業名"
+        sess.pending_options = opts[:]
+        return {"text": text, "quick": assemble_quick([], ["終了"])}
 
+    # 作業名選択（番号/テキスト両対応）
     if sess.stage == Stage.CHOOSE_TASK:
-        choice = resolve_choice(t, ALL_UNIQUE["作業名"])
+        if sess.pending_kind != "作業名" or not sess.pending_options:
+            sess.pending_kind = "作業名"
+            sess.pending_options = ALL_UNIQUE["作業名"][:]
+        choice = _resolve_from_pending(sess, t)
         if not choice:
-            return {
-                "text": "すみません、番号または候補から選んでください。\n" + ASK_TASK,
-                "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"]),
-            }
+            text = ASK_TASK + "\n\n" + _numbered_list(sess.pending_options)
+            return {"text": text, "quick": assemble_quick([], ["終了"])}
         sess.filters["作業名"] = choice
-        sess.stage = Stage.CHOOSE_BASE
-        return {
-            "text": f"『{choice}』を選択。\n\n" + ASK_BASE,
-            "quick": assemble_quick(_unique_filtered("下地の状況", sess), ["やり直す", "終了"]),
-        }
 
-    if sess.stage == Stage.CHOOSE_BASE:
+        # 次：下地の状況（全件列挙、1件ならバイパス）
+        sess.stage = Stage.CHOOSE_BASE
         base_options = _unique_filtered("下地の状況", sess)
-        choice = resolve_choice(t, base_options)
+        if len(base_options) == 1:
+            only = base_options[0]
+            sess.filters["下地の状況"] = only
+            # 深さ候補があれば深さ優先へ
+            depth_opts = _depth_opts_for_base(sess)
+            if depth_opts:
+                sess.depth_first_mode = True
+                sess.depth_selected = None
+                sess.depth_options = depth_opts[:]
+                sess.stage = Stage.CHOOSE_DEPTH
+                if len(depth_opts) == 1:
+                    # 深さも1件なら即適用して検索
+                    sess.depth_selected = depth_opts[0]
+                    return _do_search_and_maybe_refine(sess, used_optional=None)
+                sess.pending_kind = "処理する深さ・厚さ"
+                sess.pending_options = depth_opts[:]
+                text = f"『{choice}』を選択。\n\n{ASK_DEPTH}\n\n" + _numbered_list(depth_opts)
+                return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
+            # 深さ候補が無ければ任意絞り込み
+            sess.depth_first_mode = False
+            sess.depth_selected = None
+            return {"text": f"『{choice} / {only}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
+        else:
+            sess.pending_kind = "下地の状況"
+            sess.pending_options = base_options[:]
+            text = f"『{choice}』を選択。\n\n{ASK_BASE}\n\n" + _numbered_list(base_options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
+
+    # 下地の状況
+    if sess.stage == Stage.CHOOSE_BASE:
+        if sess.pending_kind != "下地の状況" or not sess.pending_options:
+            base_options = _unique_filtered("下地の状況", sess)
+            sess.pending_kind = "下地の状況"
+            sess.pending_options = base_options[:]
+        choice = _resolve_from_pending(sess, t)
         if not choice:
-            return {
-                "text": "すみません、番号または候補から選んでください。\n" + ASK_BASE,
-                "quick": assemble_quick(base_options, ["やり直す", "終了"]),
-            }
+            text = ASK_BASE + "\n\n" + _numbered_list(sess.pending_options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         sess.filters["下地の状況"] = choice
-        # ★ 深さ候補があれば必ず先に選ばせる
+
+        # 深さ候補があれば深さ優先へ（1件なら自動決定）
         depth_opts = _depth_opts_for_base(sess)
         if depth_opts:
             sess.depth_first_mode = True
             sess.depth_selected = None
             sess.depth_options = depth_opts[:]
             sess.stage = Stage.CHOOSE_DEPTH
-            return {
-                "text": f"『{choice}』を選択。\n\n" + ASK_DEPTH,
-                "quick": assemble_quick(depth_opts, ["やり直す", "終了"]),
-            }
+            if len(depth_opts) == 1:
+                sess.depth_selected = depth_opts[0]
+                # 深さ適用後に即検索 or 追加絞り込み
+                return _do_search_and_maybe_refine(sess, used_optional=None)
+            sess.pending_kind = "処理する深さ・厚さ"
+            sess.pending_options = depth_opts[:]
+            text = f"『{choice}』を選択。\n\n{ASK_DEPTH}\n\n" + _numbered_list(depth_opts)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         # 深さ候補がない場合のみ通常の任意絞り込みへ
         sess.depth_first_mode = False
         sess.depth_selected = None
         sess.stage = Stage.ASK_OPTIONAL
         return {"text": f"『{choice}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
 
-    # ★ 新ステージ：深さ/厚さを最優先で選ぶ
+    # 深さ/厚さ（番号選択）
     if sess.stage == Stage.CHOOSE_DEPTH:
-        opts = sess.depth_options or _depth_opts_for_base(sess)
-        choice = resolve_choice(t, opts)
+        if sess.pending_kind != "処理する深さ・厚さ" or not sess.pending_options:
+            opts = sess.depth_options or _depth_opts_for_base(sess)
+            sess.pending_kind = "処理する深さ・厚さ"
+            sess.pending_options = opts[:]
+        choice = _resolve_from_pending(sess, t)
         if not choice:
-            return {"text": "すみません、番号または候補から選んでください。\n" + ASK_DEPTH,
-                    "quick": assemble_quick(opts, ["やり直す", "終了"])}
+            text = ASK_DEPTH + "\n\n" + _numbered_list(sess.pending_options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         sess.depth_selected = choice
         # 深さを適用した状態で次へ
         return _do_search_and_maybe_refine(sess, used_optional=None)
-        
+
     if sess.stage == Stage.ASK_OPTIONAL:
         # 深さ優先モードで未選択なら、まず深さへ誘導
         if sess.depth_first_mode and not sess.depth_selected:
             sess.stage = Stage.CHOOSE_DEPTH
             opts = sess.depth_options or _depth_opts_for_base(sess)
-            return {"text": "まず『深さ/厚さ』を選んでください。", "quick": assemble_quick(opts, ["やり直す", "終了"])}
+            sess.pending_kind = "処理する深さ・厚さ"
+            sess.pending_options = opts[:]
+            text = "まず『深さ/厚さ』を選んでください。\n\n" + _numbered_list(opts)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         n = to_int_or_none(t)
         if n == 1:
             sess.stage = Stage.CHOOSE_MACHINE_CAT
-            return {
-                "text": ASK_MACHINE_CAT,
-                "quick": assemble_quick(_unique_filtered("機械カテゴリー", sess), ["やり直す", "終了"]),
-            }
+            options = _unique_filtered("機械カテゴリー", sess)
+            sess.pending_kind = "機械カテゴリー"
+            sess.pending_options = options[:]
+            text = ASK_MACHINE_CAT + "\n\n" + _numbered_list(options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         elif n == 2:
             sess.stage = Stage.CHOOSE_MODEL
-            return {
-                "text": ASK_MODEL,
-                "quick": assemble_quick(_unique_filtered("ライナックス機種名", sess), ["やり直す", "終了"]),
-            }
+            options = _unique_filtered("ライナックス機種名", sess)
+            sess.pending_kind = "ライナックス機種名"
+            sess.pending_options = options[:]
+            text = ASK_MODEL + "\n\n" + _numbered_list(options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         elif n == 3:
             return _do_search_and_maybe_refine(sess, used_optional=None)
         else:
             return {"text": "1/2/3 のいずれかを選んでください。\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
 
     if sess.stage == Stage.CHOOSE_MACHINE_CAT:
-        options = _unique_filtered("機械カテゴリー", sess)
-        choice = resolve_choice(t, options)
+        if sess.pending_kind != "機械カテゴリー" or not sess.pending_options:
+            options = _unique_filtered("機械カテゴリー", sess)
+            sess.pending_kind = "機械カテゴリー"
+            sess.pending_options = options[:]
+        choice = _resolve_from_pending(sess, t)
         if not choice:
-            return {
-                "text": "候補から選んでください。\n" + ASK_MACHINE_CAT,
-                "quick": assemble_quick(options, ["やり直す", "終了"]),
-            }
+            text = ASK_MACHINE_CAT + "\n\n" + _numbered_list(sess.pending_options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         sess.filters["機械カテゴリー"] = choice
         return _do_search_and_maybe_refine(sess, used_optional="機械カテゴリー")
 
     if sess.stage == Stage.CHOOSE_MODEL:
-        options = _unique_filtered("ライナックス機種名", sess)
-        choice = resolve_choice(t, options)
+        if sess.pending_kind != "ライナックス機種名" or not sess.pending_options:
+            options = _unique_filtered("ライナックス機種名", sess)
+            sess.pending_kind = "ライナックス機種名"
+            sess.pending_options = options[:]
+        choice = _resolve_from_pending(sess, t)
         if not choice:
-            return {
-                "text": "候補から選んでください。\n" + ASK_MODEL,
-                "quick": assemble_quick(options, ["やり直す", "終了"]),
-            }
+            text = ASK_MODEL + "\n\n" + _numbered_list(sess.pending_options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
         sess.filters["ライナックス機種名"] = choice
         return _do_search_and_maybe_refine(sess, used_optional="ライナックス機種名")
 
     if sess.stage == Stage.REFINE_MORE:
-        col, vals = next_refine_suggestions(sess.last_results, _used_optional(sess))
-        base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else DF
-        # 深さは未選択の時だけ提示（深さ優先を一貫）
-        depth_now = [] if sess.depth_selected else _depth_candidates_from_df(base_df)
-        combined_opts = (depth_now or []) + (vals or [])
-        
-        if not combined_opts:
-            sess.stage = Stage.SHOW_RESULTS
-            return {"text": build_results_text(sess, base_df), "quick": ["やり直す", "終了"]}
+        # 直前に提示した combined_opts の中から選んでもらう
+        if sess.pending_kind != "REFINE" or not sess.pending_options:
+            base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else DF
+            col, vals = next_refine_suggestions(base_df, _used_optional(sess))
+            depth_now = [] if sess.depth_selected else _depth_candidates_from_df(base_df)
+            combined_opts = (depth_now or []) + (vals or [])
+            sess.pending_kind = "REFINE"
+            sess.pending_options = combined_opts[:]
 
-        choice = resolve_choice(t, combined_opts)
+        choice = _resolve_from_pending(sess, t)
         if not choice:
-            hint = "候補から選んでください。"
-            if col:
-                hint = f"『{col}』または『深さ/厚さ』の候補から選んでください。"
-            return {"text": hint, "quick": assemble_quick(combined_opts, ["やり直す", "終了"])}
+            hint = "候補から番号で選んでください。"
+            text = hint + "\n\n" + _numbered_list(sess.pending_options)
+            return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
+
+        base_df = sess.last_results if (sess.last_results is not None) else DF
+        col, vals = next_refine_suggestions(base_df, _used_optional(sess))
+        depth_now = [] if sess.depth_selected else _depth_candidates_from_df(base_df)
 
         # === 実際の絞り込み ===
         filtered = base_df
@@ -640,41 +707,60 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
         if depth_now and (choice in depth_now):
             filtered = _filter_df_by_depth(base_df, choice)
-            sess.depth_selected = choice  # ← 深さを固定
+            sess.depth_selected = choice  # 深さを固定
             msg_col_part = f"深さ/厚さ ≈ {choice}"
         else:
-            if col:
+            if col and (choice in (vals or [])):
                 filtered = base_df[base_df[col] == choice]
                 msg_col_part = f"{col} = {choice}"
                 if col == "工程数":
                     sess.filters["工程数"] = choice
             else:
-                msg_col_part = f"{choice}"
+                # 何らかの直接一致（安全側で同値フィルタを試みる）
+                for c in ["機械カテゴリー", "ライナックス機種名", "作業効率評価", "工程数"]:
+                    if c in base_df.columns and choice in base_df[c].unique().tolist():
+                        filtered = base_df[base_df[c] == choice]
+                        msg_col_part = f"{c} = {choice}"
+                        if c == "工程数":
+                            sess.filters["工程数"] = choice
+                        break
+                if not msg_col_part:
+                    msg_col_part = f"{choice}"
 
-        # ここが超重要：必ず更新して次ステップの候補計算の基準にする
-        sess.last_results = filtered
+        sess.last_results = filtered  # 次の候補計算の基準
 
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
             next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
             next_depth = [] if sess.depth_selected else _depth_candidates_from_df(filtered)
-            return {
-                "text": f"『{msg_col_part}』で絞り込みました。(件数: {len(filtered)})\nさらに絞り込み可能です。",
-                "quick": assemble_quick((next_depth or []) + (next_vals or []), ["やり直す", "終了"]),
-            }
+            combined_opts = (next_depth or []) + (next_vals or [])
+            if combined_opts:
+                sess.pending_kind = "REFINE"
+                sess.pending_options = combined_opts[:]
+                text = f"『{msg_col_part}』で絞り込みました。(件数: {len(filtered)})\nさらに絞り込み可能です。\n\n" + _numbered_list(combined_opts)
+                return {"text": text, "quick": assemble_quick([], ["やり直す", "終了"])}
+            else:
+                sess.stage = Stage.SHOW_RESULTS
+                return {"text": build_results_text(sess, filtered), "quick": assemble_quick([], ["やり直す", "終了"])}
         else:
             sess.stage = Stage.SHOW_RESULTS
-            return {"text": build_results_text(sess, filtered), "quick": ["やり直す", "終了"]}
+            return {"text": build_results_text(sess, filtered), "quick": assemble_quick([], ["やり直す", "終了"])}
 
     if sess.stage == Stage.SHOW_RESULTS:
         return {"text": "新しい検索を始めるには『やり直す』を送ってください。", "quick": ["やり直す", "終了"]}
 
+    # フォールバック：作業名に戻す
     sess.stage = Stage.CHOOSE_TASK
-    return {"text": START_TEXT, "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"])}
+    opts = ALL_UNIQUE["作業名"]
+    text = START_TEXT + "\n\n" + _numbered_list(opts)
+    sess.pending_kind = "作業名"
+    sess.pending_options = opts[:]
+    return {"text": text, "quick": assemble_quick([], ["終了"])}
 
 # =============================
 # FastAPI ルーティング
 # =============================
-@app.get("/")
+# "/" に HEAD も許可（監視ツール対策）
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ok", "msg": APP_VERSION}
 
@@ -772,27 +858,11 @@ if LINE_AVAILABLE and CHANNEL_ACCESS_TOKEN and CHANNEL_SECRET:
         user_key = _source_key(src)
         out = handle_text(user_key, raw_text)
 
+        # Quick Reply は制御ボタンのみ（やり直す/終了など）
         quick = out.get("quick", [])
         actions: List[MessageAction] = []
-        pure_numeric = all(((q.strip().isdigit() and len(q.strip()) <= 2) or q in ("やり直す", "終了")) for q in quick)
-        if pure_numeric:
-            for lbl in quick[:MAX_QUICKREPLIES]:
-                actions.append(MessageAction(label=clip_label(lbl, 20), text=lbl))
-        else:
-            numbered = []
-            idx = 1
-            for q in quick:
-                if q in ("やり直す", "終了"):
-                    actions.append(MessageAction(label=q, text=q))
-                else:
-                    if len(numbered) < MAX_QUICKREPLIES:
-                        label = clip_label(f"{idx}. {q}", 20)
-                        actions.append(MessageAction(label=label, text=str(idx)))
-                        numbered.append(q)
-                        idx += 1
-            if not numbered and not actions:
-                for lbl in quick[:MAX_QUICKREPLIES]:
-                    actions.append(MessageAction(label=clip_label(lbl, 20), text=lbl))
+        for lbl in quick[:MAX_QUICKREPLIES]:
+            actions.append(MessageAction(label=clip_label(lbl, 20), text=lbl))
 
         quickreply = QuickReply(items=[QuickReplyButton(action=a) for a in actions]) if actions else None
         try:
