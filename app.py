@@ -287,6 +287,7 @@ class Stage:
     IDLE = "IDLE"
     CHOOSE_TASK = "CHOOSE_TASK"
     CHOOSE_BASE = "CHOOSE_BASE"
+    CHOOSE_DEPTH = "CHOOSE_DEPTH"
     ASK_OPTIONAL = "ASK_OPTIONAL"
     CHOOSE_MACHINE_CAT = "CHOOSE_MACHINE_CAT"
     CHOOSE_MODEL = "CHOOSE_MODEL"
@@ -341,7 +342,7 @@ def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
         "下地の状況": _as_list(sess.filters.get("下地の状況")),
         "機械カテゴリー": _as_list(sess.filters.get("機械カテゴリー")),
         "ライナックス機種名": _as_list(sess.filters.get("ライナックス機種名")),
-        "処理する深さ・厚さ": [],
+        "処理する深さ・厚さ": _as_list(sess.depth_selected), 
         "作業効率評価": [],
         "工程数": _as_list(sess.filters.get("工程数")),
     }
@@ -476,39 +477,60 @@ def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) ->
 # =============================
 def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str]) -> Dict[str, object]:
     results = apply_filters(DF, sess.filters)
-    if sess.depth_selected:
+    
+    # ★ 選択済みの深さがあれば常に適用する
+    if getattr(sess, "depth_selected", None):
         results = _filter_df_by_depth(results, sess.depth_selected)
+
     sess.last_results = results
 
     if results.empty:
         sess.stage = Stage.CHOOSE_TASK
         return {
-            "text": "該当がありませんでした。条件を見直してください。\n\nまず『作業名』から選び直しましょう。",
+            "text": "該当がありませんでした。条件を見直してください。\n\nまず『作業名』から選び直してください。",
             "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"]),
         }
 
     if len(results) >= RESULTS_REFINE_THRESHOLD:
         sess.stage = Stage.REFINE_MORE
-        col, vals = next_refine_suggestions(results, used_optional)
 
-        # 深さ/厚さ候補を抽出して Quick に混ぜる
-        depth_opts = _depth_candidates_from_df(results)
-        sess.depth_options = depth_opts[:]  # セッション保持
-        quick_opts = depth_opts + (vals or [])
+        # ★ 深さは未選択のときだけ候補に含める
+        depth_opts = [] if getattr(sess, "depth_selected", None) else _depth_candidates_from_df(results)
 
-        if not quick_opts:
-            # 何も出せない場合は即表示
+        # ★ カテゴリと機種名は常に候補化（どちらも使えるように）
+        cat_vals   = [x for x in results["機械カテゴリー"].unique().tolist() if x]
+        model_vals = [x for x in results["ライナックス機種名"].unique().tolist() if x]
+
+        # 他にも出せるなら（任意）評価や工程数など
+        eff_vals   = [x for x in results["作業効率評価"].unique().tolist() if x]
+        step_vals  = [x for x in results["工程数"].unique().tolist() if x]
+
+        # 重複を避けつつ結合（上位に出したい順）
+        combined_opts = []
+        combined_opts += depth_opts
+        combined_opts += cat_vals
+        combined_opts += model_vals
+        combined_opts += eff_vals
+        combined_opts += step_vals
+
+        if not combined_opts:
             sess.stage = Stage.SHOW_RESULTS
             return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
 
-        msg = f"該当 {len(results)} 件。"
-        if col and vals:
-            msg += f"『{col}』で更に絞り込めます。"
+        # ★ 文言を実際の候補に合わせて生成
+        hints = []
+        if cat_vals:
+            hints.append("『機械カテゴリー』で絞り込めます")
+        if model_vals:
+            hints.append("『ライナックス機種名』でも絞り込めます")
         if depth_opts:
-            msg += "\nまたは『深さ/厚さ』で絞り込めます。"
+            hints.append("または『深さ/厚さ』で絞り込めます")
+        msg_hint = "。".join(hints) + "。" if hints else ""
+
+        msg = f"該当 {len(results)} 件。{msg_hint}".strip()
         return {
             "text": msg,
-            "quick": assemble_quick(quick_opts, ["やり直す", "終了"]),
+            "quick": assemble_quick(combined_opts, ["やり直す", "終了"]),
         }
 
     # 少件数はすぐ表示（ペア候補付き）
@@ -572,7 +594,7 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
         if depth_opts:
             # 深さ優先：まず深さを選ばせる
-            sess.stage = "CHOOSE_DEPTH"
+            sess.stage = Stage.CHOOSE_DEPTH
             msg = "深さ/厚さを選んでください\n" + "\n".join(f"{i}. {v}" for i,v in enumerate(depth_opts,1))
             return {"text": f"『{choice}』を選択。\n\n{msg}", "quick": assemble_quick(depth_opts, ["やり直す", "終了"])}
 
@@ -580,7 +602,7 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         sess.stage = Stage.ASK_OPTIONAL
         return {"text": f"『{choice}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
 
-    if sess.stage == "CHOOSE_DEPTH":
+    if sess.stage == Stage.CHOOSE_DEPTH:
         opts = sess.depth_options or []
         choice = resolve_choice(t, opts)
         if not choice:
@@ -605,13 +627,18 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
             sess.stage = Stage.REFINE_MORE
             col, vals = next_refine_suggestions(filtered, _used_optional(sess))
-            depth_now = _depth_candidates_from_df(filtered)  # 追加で別深さに切替えたい時のために表示
-            quick_opts = (depth_now or []) + (vals or [])
+            depth_now = []
+
+             # ここでカテゴリ・機種名も候補化（次の2)で追加する実装と合わせる）
+            cat_vals   = [x for x in filtered["機械カテゴリー"].unique().tolist() if x]
+            model_vals = [x for x in filtered["ライナックス機種名"].unique().tolist() if x]
+
+            quick_opts = cat_vals + model_vals + (vals or [])
             msg = f"該当 {len(filtered)} 件。"
-            if col and vals:
-                msg += f"『{col}』で更に絞り込めます。"
-            if depth_now:
-                msg += "\nまたは『深さ/厚さ』で絞り込めます。"
+            if cat_vals:
+                msg += "『機械カテゴリー』で絞り込めます。"
+            if model_vals:
+                msg += "『ライナックス機種名』でも絞り込めます。"
             return {"text": msg, "quick": assemble_quick(quick_opts, ["やり直す", "終了"])}
 
         sess.stage = Stage.SHOW_RESULTS
@@ -660,14 +687,17 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
 
     if sess.stage == Stage.REFINE_MORE:
         col, vals = next_refine_suggestions(sess.last_results, _used_optional(sess))
-
-        # 直前の結果を必ず基準にする（None対策）
         base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else DF
 
-        # 表示候補（深さ/厚さ + 軸候補）
-        depth_now = _depth_candidates_from_df(base_df)
-        combined_opts = (depth_now or []) + (vals or [])
+        depth_now = [] if getattr(sess, "depth_selected", None) else _depth_candidates_from_df(base_df)
 
+        # ✅ 追加：カテゴリ/機種名/評価/工程数の候補
+        cat_vals   = [x for x in base_df["機械カテゴリー"].unique().tolist() if x]
+        model_vals = [x for x in base_df["ライナックス機種名"].unique().tolist() if x]
+        eff_vals   = [x for x in base_df["作業効率評価"].unique().tolist() if x]
+        step_vals  = [x for x in base_df["工程数"].unique().tolist() if x]
+
+        combined_opts = (depth_now or []) + cat_vals + model_vals + eff_vals + step_vals
         if not combined_opts:
             sess.stage = Stage.SHOW_RESULTS
             return {"text": build_results_text(sess, base_df), "quick": ["やり直す", "終了"]}
@@ -675,8 +705,6 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         choice = resolve_choice(t, combined_opts)
         if not choice:
             hint = "候補から選んでください。"
-            if col:
-                hint = f"『{col}』または『深さ/厚さ』の候補から選んでください。"
             return {"text": hint, "quick": assemble_quick(combined_opts, ["やり直す", "終了"])}
 
         # === 実際の絞り込み ===
@@ -684,26 +712,33 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         msg_col_part = ""
 
         if depth_now and (choice in depth_now):
+            sess.depth_selected = choice   # 深さを固定
             filtered = _filter_df_by_depth(base_df, choice)
-            msg_col_part = f"深さ/厚さ ≈ {choice}"
+            msg_col_part = f"深さ/厚さ = {choice}"
         else:
-            if col:
-                filtered = base_df[base_df[col] == choice]
-                msg_col_part = f"{col} = {choice}"
-                if col == "工程数":
-                    sess.filters["工程数"] = choice
-            else:
+            for c in ["機械カテゴリー", "ライナックス機種名", "作業効率評価", "工程数"]:
+                if c in base_df.columns and choice in base_df[c].unique().tolist():
+                    filtered = base_df[base_df[c] == choice]
+                    msg_col_part = f"{c} = {choice}"
+                    if c == "工程数":
+                        sess.filters["工程数"] = choice
+                    break
+            if not msg_col_part:
                 msg_col_part = f"{choice}"
 
-        # ここが超重要：必ず更新して次ステップの候補計算の基準にする
         sess.last_results = filtered
 
-        if len(filtered) >= RESULTS_REFINE_THRESHOLD:
-            next_col, next_vals = next_refine_suggestions(filtered, _used_optional(sess))
-            next_depth = _depth_candidates_from_df(filtered)
+        next_depth = [] if getattr(sess, "depth_selected", None) else _depth_candidates_from_df(filtered)
+        next_cat   = [x for x in filtered["機械カテゴリー"].unique().tolist() if x]
+        next_model = [x for x in filtered["ライナックス機種名"].unique().tolist() if x]
+        next_eff   = [x for x in filtered["作業効率評価"].unique().tolist() if x]
+        next_step  = [x for x in filtered["工程数"].unique().tolist() if x]
+        next_opts  = (next_depth or []) + next_cat + next_model + next_eff + next_step
+
+        if len(filtered) >= RESULTS_REFINE_THRESHOLD and next_opts:
             return {
                 "text": f"『{msg_col_part}』で絞り込みました。(件数: {len(filtered)})\nさらに絞り込み可能です。",
-                "quick": assemble_quick((next_depth or []) + (next_vals or []), ["やり直す", "終了"]),
+                "quick": assemble_quick(next_opts, ["やり直す", "終了"]),
             }
         else:
             sess.stage = Stage.SHOW_RESULTS
