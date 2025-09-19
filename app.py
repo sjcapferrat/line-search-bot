@@ -280,6 +280,15 @@ def _filter_df_by_depth(df: pd.DataFrame, choice: str) -> pd.DataFrame:
 
 # -------------------------------------------------------------
 
+# ---- 機械カテゴリーまたはライナックス機種名の軸候補ユーティリティ -------------------------------
+AXIS_LABELS = ("機械カテゴリー", "ライナックス機種名")
+
+def _axis_values(df: pd.DataFrame) -> Dict[str, List[str]]:
+    return {
+        "機械カテゴリー": [x for x in df["機械カテゴリー"].unique().tolist() if x],
+        "ライナックス機種名": [x for x in df["ライナックス機種名"].unique().tolist() if x],
+    }
+
 # =============================
 # セッション管理
 # =============================
@@ -293,6 +302,8 @@ class Stage:
     CHOOSE_MODEL = "CHOOSE_MODEL"
     SHOW_RESULTS = "SHOW_RESULTS"
     REFINE_MORE = "REFINE_MORE"
+    CHOOSE_AXIS = "CHOOSE_AXIS"
+    CHOOSE_AXIS_VALUE = "CHOOSE_AXIS_VALUE"
 
 class SearchSession:
     def __init__(self):
@@ -310,6 +321,8 @@ class SearchSession:
         # 多数時に提示する深さ/厚さ候補
         self.depth_options: List[str] = []
         self.depth_selected: Optional[str] = None
+        # 機械カテゴリー" or "ライナックス機種名の選択
+        self.refine_axis: Optional[str] = None
 
     def reset(self):
         self.__init__()
@@ -494,44 +507,40 @@ def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str
     if len(results) >= RESULTS_REFINE_THRESHOLD:
         sess.stage = Stage.REFINE_MORE
 
-        # ★ 深さは未選択のときだけ候補に含める
+        # 深さは未選択のときだけ候補
         depth_opts = [] if getattr(sess, "depth_selected", None) else _depth_candidates_from_df(results)
 
-        # ★ カテゴリと機種名は常に候補化（どちらも使えるように）
-        cat_vals   = [x for x in results["機械カテゴリー"].unique().tolist() if x]
-        model_vals = [x for x in results["ライナックス機種名"].unique().tolist() if x]
+        axes = _axis_values(results)
+        cat_vals, model_vals = axes["機械カテゴリー"], axes["ライナックス機種名"]
 
-        # 他にも出せるなら（任意）評価や工程数など
-        eff_vals   = [x for x in results["作業効率評価"].unique().tolist() if x]
-        step_vals  = [x for x in results["工程数"].unique().tolist() if x]
-
-        # 重複を避けつつ結合（上位に出したい順）
-        combined_opts = []
-        combined_opts += depth_opts
-        combined_opts += cat_vals
-        combined_opts += model_vals
-        combined_opts += eff_vals
-        combined_opts += step_vals
-
-        if not combined_opts:
-            sess.stage = Stage.SHOW_RESULTS
-            return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
-
-        # ★ 文言を実際の候補に合わせて生成
-        hints = []
-        if cat_vals:
-            hints.append("『機械カテゴリー』で絞り込めます")
-        if model_vals:
-            hints.append("『ライナックス機種名』でも絞り込めます")
+        # ★まず深さが未選択なら深さを最優先で提示（要件維持）
         if depth_opts:
-            hints.append("または『深さ/厚さ』で絞り込めます")
-        msg_hint = "。".join(hints) + "。" if hints else ""
+            return {
+                "text": f"該当 {len(results)} 件。まず『深さ/厚さ』で絞り込んでください。",
+                "quick": assemble_quick(depth_opts, ["やり直す", "終了"]),
+            }
 
-        msg = f"該当 {len(results)} 件。{msg_hint}".strip()
-        return {
-            "text": msg,
-            "quick": assemble_quick(combined_opts, ["やり直す", "終了"]),
-        }
+        # ★深さ済み→軸を先に選ばせる（両方ある場合）
+        if cat_vals and model_vals:
+            sess.stage = Stage.CHOOSE_AXIS
+            sess.refine_axis = None
+            return {
+                "text": f"該当 {len(results)} 件。どちらで絞り込みますか？",
+                "quick": assemble_quick(list(AXIS_LABELS), ["やり直す", "終了"]),
+            }
+
+        # 片方のみ→その軸の具体候補を直接提示
+        if cat_vals or model_vals:
+            sess.stage = Stage.CHOOSE_AXIS_VALUE
+            sess.refine_axis = "機械カテゴリー" if cat_vals else "ライナックス機種名"
+            axis_opts = cat_vals if cat_vals else model_vals
+            return {
+                "text": f"該当 {len(results)} 件。『{sess.refine_axis}』から選んでください。",
+                "quick": assemble_quick(axis_opts, ["やり直す", "終了"]),
+            }
+
+        # 軸が出せない場合はそのまま表示（工程数/評価での更絞りはオプション扱い）
+        return {"text": build_results_text(sess, results), "quick": ["やり直す", "終了"]}
 
     # 少件数はすぐ表示（ペア候補付き）
     sess.stage = Stage.SHOW_RESULTS
@@ -625,21 +634,99 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
             }
 
         if len(filtered) >= RESULTS_REFINE_THRESHOLD:
-            sess.stage = Stage.REFINE_MORE
-            col, vals = next_refine_suggestions(filtered, _used_optional(sess))
-            depth_now = []
+            # ★ 二段階：まず軸を選ばせる
+            axes = _axis_values(filtered)
+            cat_vals, model_vals = axes["機械カテゴリー"], axes["ライナックス機種名"]
+            if cat_vals and model_vals:
+                sess.stage = Stage.CHOOSE_AXIS
+                sess.refine_axis = None
+                return {
+                    "text": f"該当 {len(filtered)} 件。どちらで絞り込みますか？",
+                    "quick": assemble_quick(list(AXIS_LABELS), ["やり直す", "終了"]),
+                }
+            else:
+                # 片方しか無い→その軸の具体候補を出す
+                sess.stage = Stage.CHOOSE_AXIS_VALUE
+                sess.refine_axis = "機械カテゴリー" if cat_vals else "ライナックス機種名"
+                axis_opts = cat_vals if cat_vals else model_vals
+                return {
+                    "text": f"該当 {len(filtered)} 件。『{sess.refine_axis}』から選んでください。",
+                    "quick": assemble_quick(axis_opts, ["やり直す", "終了"]),
+                }
 
-             # ここでカテゴリ・機種名も候補化（次の2)で追加する実装と合わせる）
-            cat_vals   = [x for x in filtered["機械カテゴリー"].unique().tolist() if x]
-            model_vals = [x for x in filtered["ライナックス機種名"].unique().tolist() if x]
+        sess.stage = Stage.SHOW_RESULTS
+        return {"text": build_results_text(sess, filtered), "quick": ["やり直す", "終了"]}
 
-            quick_opts = cat_vals + model_vals + (vals or [])
-            msg = f"該当 {len(filtered)} 件。"
-            if cat_vals:
-                msg += "『機械カテゴリー』で絞り込めます。"
-            if model_vals:
-                msg += "『ライナックス機種名』でも絞り込めます。"
-            return {"text": msg, "quick": assemble_quick(quick_opts, ["やり直す", "終了"])}
+    if sess.stage == Stage.CHOOSE_AXIS:
+        choice = resolve_choice(t, list(AXIS_LABELS))
+        if not choice:
+            return {
+                "text": "『機械カテゴリー』または『ライナックス機種名』から選んでください。",
+                "quick": assemble_quick(list(AXIS_LABELS), ["やり直す", "終了"]),
+            }
+        sess.refine_axis = choice
+        base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else apply_filters(DF, sess.filters)
+        if getattr(sess, "depth_selected", None):
+            base_df = _filter_df_by_depth(base_df, sess.depth_selected)
+
+        axes = _axis_values(base_df)
+        axis_opts = axes[choice]
+        if not axis_opts:
+            # 軸に該当が無い場合はすぐ結果表示へ
+            sess.stage = Stage.SHOW_RESULTS
+            return {"text": build_results_text(sess, base_df), "quick": ["やり直す", "終了"]}
+
+        sess.stage = Stage.CHOOSE_AXIS_VALUE
+        return {
+            "text": f"『{choice}』で絞り込みます。候補から選んでください。",
+            "quick": assemble_quick(axis_opts, ["やり直す", "終了"]),
+        }
+
+    if sess.stage == Stage.CHOOSE_AXIS_VALUE:
+        base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else apply_filters(DF, sess.filters)
+        if getattr(sess, "depth_selected", None):
+            base_df = _filter_df_by_depth(base_df, sess.depth_selected)
+
+        axis = sess.refine_axis or "機械カテゴリー"
+        axes = _axis_values(base_df)
+        axis_opts = axes.get(axis, [])
+
+        choice = resolve_choice(t, axis_opts)
+        if not choice:
+            return {
+                "text": f"『{axis}』の候補から選んでください。",
+                "quick": assemble_quick(axis_opts, ["やり直す", "終了"]),
+            }
+
+        # フィルタ適用
+        filtered = base_df[base_df[axis] == choice]
+        sess.last_results = filtered
+        # 一回絞ったら軸はクリア（次はまた軸から聞く）
+        sess.refine_axis = None
+
+        if filtered.empty:
+            sess.stage = Stage.SHOW_RESULTS
+            return {"text": "該当がありませんでした。", "quick": ["やり直す", "終了"]}
+
+        # 次も両軸が残っていれば再度“どちらで絞る？”、片方なら直接その候補へ
+        if len(filtered) >= RESULTS_REFINE_THRESHOLD:
+            axes2 = _axis_values(filtered)
+            cat2, model2 = axes2["機械カテゴリー"], axes2["ライナックス機種名"]
+            if cat2 and model2:
+                sess.stage = Stage.CHOOSE_AXIS
+                return {
+                    "text": f"『{axis} = {choice}』で絞り込みました。(件数: {len(filtered)})\n次はどちらで絞り込みますか？",
+                    "quick": assemble_quick(list(AXIS_LABELS), ["やり直す", "終了"]),
+                }
+            elif cat2 or model2:
+                sess.stage = Stage.CHOOSE_AXIS_VALUE
+                only_axis = "機械カテゴリー" if cat2 else "ライナックス機種名"
+                sess.refine_axis = only_axis
+                axis_opts2 = cat2 if cat2 else model2
+                return {
+                    "text": f"『{axis} = {choice}』で絞り込みました。(件数: {len(filtered)})\n『{only_axis}』から選んでください。",
+                    "quick": assemble_quick(axis_opts2, ["やり直す", "終了"]),
+                }
 
         sess.stage = Stage.SHOW_RESULTS
         return {"text": build_results_text(sess, filtered), "quick": ["やり直す", "終了"]}
@@ -690,6 +777,17 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
         base_df: pd.DataFrame = sess.last_results if (sess.last_results is not None) else DF
 
         depth_now = [] if getattr(sess, "depth_selected", None) else _depth_candidates_from_df(base_df)
+
+        if getattr(sess, "depth_selected", None):
+                base_df = _filter_df_by_depth(base_df, sess.depth_selected)
+
+        axes = _axis_values(base_df)
+        if axes["機械カテゴリー"] and axes["ライナックス機種名"] and not sess.refine_axis:
+            sess.stage = Stage.CHOOSE_AXIS
+            return {
+            "text": f"該当 {len(base_df)} 件。どちらで絞り込みますか？",
+            "quick": assemble_quick(list(AXIS_LABELS), ["やり直す", "終了"]),
+            }
 
         # ✅ 追加：カテゴリ/機種名/評価/工程数の候補
         cat_vals   = [x for x in base_df["機械カテゴリー"].unique().tolist() if x]
