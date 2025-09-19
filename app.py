@@ -308,6 +308,7 @@ class SearchSession:
         self.last_unfiltered_hits: List[Dict] = []
         # 多数時に提示する深さ/厚さ候補
         self.depth_options: List[str] = []
+        self.depth_selected: Optional[str] = None
 
     def reset(self):
         self.__init__()
@@ -346,33 +347,65 @@ def _make_query_for_formatters(sess: SearchSession) -> Dict[str, object]:
     }
 
 # --- 結果のテキストを生成（ペア補完＋並び順＋件数ヘッダは formatters に任せる） ---
+def _row_key(r: dict) -> tuple:
+    # ヒット集合を安定識別するキー（工程や深さも含む）
+    return (
+        r.get("作業名",""), r.get("下地の状況",""),
+        r.get("ライナックス機種名",""), r.get("使用カッター名",""),
+        r.get("工程数",""), r.get("処理する深さ・厚さ","")
+    )
+
 def build_results_text(sess: SearchSession, filtered_df: pd.DataFrame) -> str:
-    # 前段（未絞り込み）は「作業名＋下地」のみ適用
+    # いま表示対象（= 本当にヒットした行）
+    cur_rows = filtered_df.to_dict(orient="records")
+    cur_rows = _annotate_stage_flags(cur_rows)
+    hit_keys = { _row_key(r) for r in cur_rows }
+
+    # 「作業名＋下地」だけで抽出（ペア補完のベース）
     base_filters = {k: v for k, v in sess.filters.items() if k in ("作業名", "下地の状況")}
     prev_df = apply_filters(DF, base_filters)
-    prev_rows = prev_df.to_dict(orient="records")
+    prev_rows = _annotate_stage_flags(prev_df.to_dict(orient="records"))
     sess.last_unfiltered_hits = prev_rows
 
-    # 現在の表示対象
-    cur_rows = filtered_df.to_dict(orient="records")
-
-    # _stage/_hit_stage を付与してからペア補完
-    cur_rows = _annotate_stage_flags(cur_rows)
-    prev_rows = _annotate_stage_flags(prev_rows)
-
-    # ペア候補を補完
+    # ペア補完
     augmented = prepare_with_pairs(cur_rows, prev_rows)
 
-    # ★ ここを追加：ペアで補完された行(_pair_candidate=True)は「検索対象でないペア工程」
-    #    ＝ ヒットではない。逆に、ペアでない行はヒット扱い。
-    for r in augmented:
-        r["_hit_stage"] = not bool(r.get("_pair_candidate"))
-
-    # 一次/二次の並べ方を整える（postprocess.reorder_and_pair がある場合）
+    # 並べ替え（ここでカスタムキーが落ちても後で上書きする）
     try:
         augmented = reorder_and_pair(augmented)
     except Exception:
         pass
+
+    # === 最終ラベリング ===
+    # ルール：
+    #  - _row_key が hit_keys に含まれる → 「検索ヒットした工程」
+    #  - それ以外で A/B 工程 or _pair_candidate=True → 「検索結果とペアになる工程」
+    #  - 単一工程はラベル空
+    for r in augmented:
+        st = (r.get("_stage") or "").upper()
+        is_single = (st == "SINGLE")
+        in_hits = (_row_key(r) in hit_keys)
+        is_pair_flag = bool(r.get("_pair_candidate", False))
+        is_pair_stage = (st in ("A","B")) or ("一次" in (r.get("工程数",""))) or ("二次" in (r.get("工程数","")))
+
+        if is_single:
+            r["_is_hit"] = in_hits
+            r["_hit_stage"] = in_hits
+            r["_hit_label"] = ""   # 単一はラベル空
+        else:
+            if in_hits:
+                r["_is_hit"] = True
+                r["_hit_stage"] = True
+                r["_hit_label"] = "検索ヒットした工程"
+            elif is_pair_flag or is_pair_stage:
+                r["_is_hit"] = False
+                r["_hit_stage"] = False
+                r["_hit_label"] = "検索結果とペアになる工程"
+            else:
+                # 念のためのフォールバック（通常ここには来ない）
+                r["_is_hit"] = in_hits
+                r["_hit_stage"] = in_hits
+                r["_hit_label"] = "検索ヒットした工程" if in_hits else ""
 
     qdict = _make_query_for_formatters(sess)
     return to_plain_text(augmented, qdict, explain="")
@@ -443,6 +476,8 @@ def next_refine_suggestions(rows: pd.DataFrame, used_optional: Optional[str]) ->
 # =============================
 def _do_search_and_maybe_refine(sess: SearchSession, used_optional: Optional[str]) -> Dict[str, object]:
     results = apply_filters(DF, sess.filters)
+    if sess.depth_selected:
+        results = _filter_df_by_depth(results, sess.depth_selected)
     sess.last_results = results
 
     if results.empty:
@@ -528,8 +563,59 @@ def handle_text(user_key: str, text: str) -> Dict[str, object]:
                 "quick": assemble_quick(base_options, ["やり直す", "終了"]),
             }
         sess.filters["下地の状況"] = choice
+
+        # ★ 深さ候補の抽出（作業名＋下地で限定）
+        base_df = apply_filters(DF, {k:v for k,v in sess.filters.items() if k in ("作業名","下地の状況")})
+        depth_opts = _depth_candidates_from_df(base_df, limit=99999)
+        sess.depth_options = depth_opts[:]
+        sess.depth_selected = None
+
+        if depth_opts:
+            # 深さ優先：まず深さを選ばせる
+            sess.stage = "CHOOSE_DEPTH"
+            msg = "深さ/厚さを選んでください\n" + "\n".join(f"{i}. {v}" for i,v in enumerate(depth_opts,1))
+            return {"text": f"『{choice}』を選択。\n\n{msg}", "quick": assemble_quick(depth_opts, ["やり直す", "終了"])}
+
+        # 深さ候補が無いときだけ任意絞り込みへ
         sess.stage = Stage.ASK_OPTIONAL
         return {"text": f"『{choice}』を選択。\n\n" + ASK_OPTIONAL, "quick": ["1", "2", "3", "やり直す", "終了"]}
+
+    if sess.stage == "CHOOSE_DEPTH":
+        opts = sess.depth_options or []
+        choice = resolve_choice(t, opts)
+        if not choice:
+            msg = "すみません、番号または候補から選んでください。\n深さ/厚さを選んでください\n" + "\n".join(f"{i}. {v}" for i,v in enumerate(opts,1))
+            return {"text": msg, "quick": assemble_quick(opts, ["やり直す", "終了"])}
+
+        # 深さを確定
+        sess.depth_selected = choice
+
+        # 以降の検索に深さを必ず適用
+        base_df = apply_filters(DF, sess.filters)
+        filtered = _filter_df_by_depth(base_df, choice)
+        sess.last_results = filtered
+
+        if filtered.empty:
+            sess.stage = Stage.CHOOSE_TASK
+            return {
+                "text": "該当がありませんでした。条件を見直してください。\n\nまず『作業名』から選び直しましょう。",
+                "quick": assemble_quick(ALL_UNIQUE["作業名"], ["終了"]),
+            }
+
+        if len(filtered) >= RESULTS_REFINE_THRESHOLD:
+            sess.stage = Stage.REFINE_MORE
+            col, vals = next_refine_suggestions(filtered, _used_optional(sess))
+            depth_now = _depth_candidates_from_df(filtered)  # 追加で別深さに切替えたい時のために表示
+            quick_opts = (depth_now or []) + (vals or [])
+            msg = f"該当 {len(filtered)} 件。"
+            if col and vals:
+                msg += f"『{col}』で更に絞り込めます。"
+            if depth_now:
+                msg += "\nまたは『深さ/厚さ』で絞り込めます。"
+            return {"text": msg, "quick": assemble_quick(quick_opts, ["やり直す", "終了"])}
+
+        sess.stage = Stage.SHOW_RESULTS
+        return {"text": build_results_text(sess, filtered), "quick": ["やり直す", "終了"]}
 
     if sess.stage == Stage.ASK_OPTIONAL:
         n = to_int_or_none(t)
